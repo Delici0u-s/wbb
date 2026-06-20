@@ -21,6 +21,8 @@ exposes that buffer as a composable, scriptable async Python primitive.
                               SDL2 window           any consumer
 ```
 
+[github repository](https://github.com/Delici0u-s/wbb)
+
 ## Requirements
 
 - Python 3.10+

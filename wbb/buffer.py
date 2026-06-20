@@ -28,6 +28,7 @@ import asyncio
 import logging
 import struct
 import threading
+import time
 from contextlib import suppress
 from typing import AsyncIterator, Optional
 
@@ -100,35 +101,64 @@ class FrameBuffer:
     # ------------------------------------------------------------------
 
     def write(self, rgba: np.ndarray) -> int:
-        """
-        Write *rgba* (H×W×4 uint8) into the inactive buffer, then flip.
-
-        Returns the new frame_id.
-        """
         import time
 
         if rgba.shape != (self.height, self.width, 4):
             raise ValueError(f"Expected shape ({self.height}, {self.width}, 4), got {rgba.shape}")
 
+        # next_idx is only ever touched by the writer thread (BrowserBridge
+        # drives this from a single executor at a time), so reading/flipping
+        # it doesn't need the lock either -- only the metadata write +
+        # frame_counter increment need to be atomic w.r.t. concurrent readers.
+        next_idx = self._write_index ^ 1
+        target = self._arr_a if next_idx == 0 else self._arr_b
+
+        # Memcpy happens OUTSIDE the lock. Readers only ever read the
+        # *currently active* buffer (per the metadata), never the inactive
+        # one we're writing into here, so there's no race to guard against.
+        np.copyto(target, rgba)
+
         with self._lock:
             self._frame_counter += 1
             fid = self._frame_counter
             ts = time.monotonic()
-            next_idx = self._write_index ^ 1
-
-            # write into the currently inactive buffer
-            target = self._arr_a if next_idx == 0 else self._arr_b
-            np.copyto(target, rgba)
-
-            # update metadata atomically (single byte flip last)
             packed = struct.pack(_META_FMT, next_idx, fid, ts)
             self._shm_meta.buf[:_META_SIZE] = packed
-
             self._write_index = next_idx
 
         self._new_frame_event.set()
         self._new_frame_event.clear()
         return fid
+
+    # def write(self, rgba: np.ndarray) -> int:
+    #     """
+    #     Write *rgba* (H×W×4 uint8) into the inactive buffer, then flip.
+    #
+    #     Returns the new frame_id.
+    #     """
+    #
+    #     if rgba.shape != (self.height, self.width, 4):
+    #         raise ValueError(f"Expected shape ({self.height}, {self.width}, 4), got {rgba.shape}")
+    #
+    #     with self._lock:
+    #         self._frame_counter += 1
+    #         fid = self._frame_counter
+    #         ts = time.monotonic()
+    #         next_idx = self._write_index ^ 1
+    #
+    #         # write into the currently inactive buffer
+    #         target = self._arr_a if next_idx == 0 else self._arr_b
+    #         np.copyto(target, rgba)
+    #
+    #         # update metadata atomically (single byte flip last)
+    #         packed = struct.pack(_META_FMT, next_idx, fid, ts)
+    #         self._shm_meta.buf[:_META_SIZE] = packed
+    #
+    #         self._write_index = next_idx
+    #
+    #     self._new_frame_event.set()
+    #     self._new_frame_event.clear()
+    #     return fid
 
     # ------------------------------------------------------------------
     # Reader interface
