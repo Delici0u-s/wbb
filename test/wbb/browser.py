@@ -460,6 +460,112 @@ class BrowserBridge:
                 clickCount=1,
             )
 
+    async def click_element(
+        self,
+        selector: Optional[str] = None,
+        *,
+        text: Optional[str] = None,
+        nth: int = 0,
+        scroll_into_view: bool = False,
+        timeout: float = 5.0,
+        poll_interval: float = 0.15,
+        button: str = "left",
+    ) -> bool:
+        """
+        Click an element identified by *selector* and/or *text*, instead
+        of a hardcoded pixel position.
+
+        Resolution order
+        -----------------
+        1. If *selector* is given, ``document.querySelectorAll(selector)``
+           is evaluated. If it yields at least one match, *nth* of those
+           matches is used directly (selector matches are NOT redirected
+           to a clickable ancestor — if you wrote the selector, you meant
+           that element).
+        2. Otherwise — or if *selector* matched nothing — *text* is used
+           as a case-insensitive substring match against every element's
+           *own* text content (direct text-node children only, not
+           descendants' concatenated text). Each match is then resolved
+           to its nearest clickable ancestor (``a``, ``button``, ``input``,
+           ``select``, ``textarea``, ``[role="button"]``, ``[onclick]``,
+           ``summary``, ``label``, or the matched element itself if it's
+           already one of those) and the result list is de-duplicated.
+           This matters in practice: matching text like "Login" inside
+           ``<button><b>Login</b></button>`` should click the button, not
+           the inert ``<b>`` wrapping it — verified against jsdom, see
+           module docstring.
+        3. If neither resolves to an element within *timeout* seconds,
+           returns False without raising.
+
+        Coordinates
+        -----------
+        The resolved element's ``getBoundingClientRect()`` center is used
+        as the click point, passed straight to ``self.click()`` — same
+        Input.dispatchMouseEvent path as a manual hardcoded-coordinate
+        click.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector, tried first.
+        text:
+            Substring to match against element text content; fallback if
+            *selector* is None or matches nothing.
+        nth:
+            Index into the match list if more than one element matches
+            (default: first match, 0).
+        scroll_into_view:
+            If True, calls ``element.scrollIntoView()`` and re-reads the
+            bounding box before clicking. Default False, per your call —
+            this does not scroll unless asked, since scrolling can shift
+            unrelated layout and cause a different mis-click.
+        timeout, poll_interval:
+            Same semantics as ``wait_for_selector`` — poll until the
+            element appears or *timeout* elapses.
+        button:
+            Forwarded to ``self.click()``.
+
+        Returns
+        -------
+        bool
+            True if an element was found and clicked, False on timeout.
+
+        Raises
+        ------
+        RuntimeError
+            If input is disabled — raised by the underlying ``click()``
+            call's ``self._require_input()`` check.
+        ValueError
+            If neither *selector* nor *text* is given.
+        """
+        if selector is None and text is None:
+            raise ValueError("click_element requires at least one of selector or text")
+
+        finder_js = _build_finder_js(selector, text, nth)
+
+        elapsed = 0.0
+        while True:
+            box = await self.eval(finder_js)
+            if box is not None:
+                break
+            if elapsed >= timeout:
+                return False
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        if scroll_into_view:
+            scroll_js = _build_finder_js(selector, text, nth, scroll_into_view=True)
+            box = await self.eval(scroll_js)
+            if box is None:
+                # Element disappeared between the find and the scroll —
+                # treat as not found rather than clicking stale coords.
+                return False
+
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        await self.click(cx, cy, button=button)
+        return True
+
     async def move(self, x: float, y: float) -> None:
         self._require_input()
         await self._send("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y)
@@ -553,3 +659,78 @@ def _jpeg_to_rgba(data_b64: str, width: int, height: int) -> np.ndarray:
     if img.size != (width, height):
         img = img.resize((width, height), Image.LANCZOS)  # type: ignore[attr-defined]
     return np.asarray(img, dtype=np.uint8)
+
+
+# Elements considered "clickable" when resolving a text match to its
+# nearest interactive ancestor. Selector matches skip this entirely.
+_CLICKABLE_SEL = 'a,button,input,select,textarea,[role="button"],[onclick],summary,label'
+
+
+def _build_finder_js(
+    selector: Optional[str],
+    text: Optional[str],
+    nth: int,
+    *,
+    scroll_into_view: bool = False,
+) -> str:
+    """
+    Build a JS expression for Runtime.evaluate that resolves an element by
+    selector (preferred) or text substring (fallback) and returns its
+    bounding box as ``{x, y, width, height}`` (viewport-relative — the
+    coordinate space `Input.dispatchMouseEvent` expects), or ``null`` if
+    nothing resolves.
+
+    *selector* and *text* are JSON-encoded into the expression so
+    arbitrary strings (quotes, backslashes, unicode) embed safely —
+    `json.dumps` rather than Python `repr`, since this is JS, not Python
+    (the existing `wait_for_selector` uses `repr` because it calls
+    `querySelector` directly with a Python-side f-string; this builds a
+    bigger expression so a JSON literal is cleaner).
+    """
+    sel_json = json.dumps(selector) if selector is not None else "null"
+    text_json = json.dumps(text) if text is not None else "null"
+    scroll_json = "true" if scroll_into_view else "false"
+
+    return f"""
+(() => {{
+    const sel = {sel_json};
+    const textNeedle = {text_json};
+    const nth = {nth};
+    const doScroll = {scroll_json};
+    const CLICKABLE_SEL = {json.dumps(_CLICKABLE_SEL)};
+
+    function nearestClickable(el) {{
+        if (el.matches && el.matches(CLICKABLE_SEL)) return el;
+        const anc = el.closest ? el.closest(CLICKABLE_SEL) : null;
+        return anc || el;
+    }}
+
+    let matches = [];
+    if (sel !== null) {{
+        matches = Array.from(document.querySelectorAll(sel));
+    }}
+    if (matches.length === 0 && textNeedle !== null) {{
+        const needle = textNeedle.toLowerCase();
+        matches = Array.from(document.querySelectorAll('*')).filter(el => {{
+            let own = '';
+            for (const node of el.childNodes) {{
+                if (node.nodeType === Node.TEXT_NODE) own += node.textContent;
+            }}
+            return own.toLowerCase().includes(needle);
+        }});
+        matches = matches.map(nearestClickable);
+        matches = Array.from(new Set(matches));
+    }}
+
+    const el = matches[nth];
+    if (!el) return null;
+
+    if (doScroll) {{
+        el.scrollIntoView({{ block: 'center', inline: 'center' }});
+    }}
+
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return null;  // detached/hidden
+    return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
+}})()
+"""

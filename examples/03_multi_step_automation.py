@@ -20,47 +20,82 @@ async def main() -> None:
     async with BrowserBridge(buf, width=WIDTH, height=HEIGHT, enable_input=True) as br:
         # Step 1: Navigate to a search engine
         print("Step 1: Navigate")
-        await br.navigate("https://duckduckgo.com")
-        await br.wait_for_load()
+        await br.navigate("https://www.wikipedia.org/")
 
-        frame = buf.read()
+        frame = await buf.next_frame()
         frame.save("step1_loaded.png")
         print(f"  → Saved step1_loaded.png ({frame.width}×{frame.height})")
 
         # Step 2: Focus the search box and type a query
         print("Step 2: Type query")
-        await br.click(640, 300)
+        await br.click(600, 500)
         await asyncio.sleep(0.3)
-        await br.type("WebView Buffer Bridge Python")
+        await br.type("Pythagorean th")
+        for i in "eorem":
+            await br.key(i)
+
         await asyncio.sleep(0.2)
-        await br.key("Enter")
+        frame.save("step2_results.png")
+        print("  → Saved step2_results.png")
+        # This works as return
+        await br.key("\r")
+
+        # This doesnt work
+        # await br.key("Enter", kind="keyDown")
+        # await asyncio.sleep(0.1)
+        # await br.key("Enter", kind="keyUp")
+
+        # This again works
+        # manual form submit since key does not work
+        # await br.eval("document.querySelector('input[name=q]')?.closest('form')?.submit()")
 
         # Step 3: Wait for results
         print("Step 3: Wait for results")
-        await br.wait_for_load(timeout=10)
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(1.0)  # yes i know, bad programming
 
         frame = buf.read()
+
         frame.save("step3_results.png")
         print("  → Saved step3_results.png")
 
-        # Step 4: Extract result count via JS
-        count_text = await br.eval(
-            "document.querySelector('.result__title') ? "
-            "document.querySelectorAll('.result__title').length.toString() : '0'"
-        )
-        print(f"Step 4: Results on page: {count_text}")
+        await br.click(316, 310)
+        # risky version
+        # await asyncio.sleep(1.0)  # yes i know, bad programming
+        # frame = buf.read()
+        # better version
+        await asyncio.sleep(2.0)  # imagine long loading here
+        frame = await buf.next_frame(
+            2
+        )  # i intorduced/added/implemented the imeout, so long waiting can be done no problem
+        frame.save("step4_results.png")
+        print("  → Saved step4_results.png")
 
-        # Step 5: Click the first result
-        print("Step 5: Click first result")
-        await br.eval("document.querySelector('.result__title a')?.click()")
-        await br.wait_for_load(timeout=15)
-        await asyncio.sleep(2.0)
+        # Step 5: Open the language switcher via CSS selector.
+        # On en.wikipedia.org article pages this checkbox toggles the
+        # language-list panel open/closed (it's a hidden checkbox driving
+        # a CSS :checked selector, not a button — clicking its hitbox via
+        # the label is what actually shows the panel).
+        print("Step 5: Click language switcher (selector)")
+        found = await br.click_element("#p-lang-btn-checkbox")
+        print(f"  → clicked: {found}")
+        await asyncio.sleep(0.5)  # let the panel's CSS transition settle
 
-        frame = buf.read()
-        frame.save("step5_destination.png")
-        print("  → Saved step5_destination.png")
-        print("Done.")
+        frame = await buf.next_frame(2)
+        frame.save("step5_lang_panel_open.png")
+        print("  → Saved step5_lang_panel_open.png")
+
+        # Step 6: Click "Deutsch" in the now-open language list, by text.
+        # No selector for this one on purpose — it's the text-fallback
+        # path that's being demonstrated here.
+        print("Step 6: Click 'Deutsch' (text fallback)")
+        found = await br.click_element(text="Deutsch")
+        print(f"  → clicked: {found}")
+        await asyncio.sleep(1.0)  # allow navigation to the German article
+
+        frame = await buf.next_frame(2)
+        frame.save("step6_deutsch_page.png")
+        print("  → Saved step6_deutsch_page.png")
+
         del frame  # release the zero-copy view before the buffer closes
 
     buf.close()

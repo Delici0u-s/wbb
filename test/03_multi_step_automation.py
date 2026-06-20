@@ -63,12 +63,38 @@ async def main() -> None:
         # await asyncio.sleep(1.0)  # yes i know, bad programming
         # frame = buf.read()
         # better version
-        await asyncio.sleep(10.0)  # imagine long loading here
+        await asyncio.sleep(2.0)  # imagine long loading here
         frame = await buf.next_frame(
             2
         )  # i intorduced/added/implemented the imeout, so long waiting can be done no problem
         frame.save("step4_results.png")
         print("  → Saved step4_results.png")
+
+        # Step 5: Open the language switcher via CSS selector.
+        # On en.wikipedia.org article pages this checkbox toggles the
+        # language-list panel open/closed (it's a hidden checkbox driving
+        # a CSS :checked selector, not a button — clicking its hitbox via
+        # the label is what actually shows the panel).
+        print("Step 5: Click language switcher (selector)")
+        found = await br.click_element("#p-lang-btn-checkbox")
+        print(f"  → clicked: {found}")
+        await asyncio.sleep(0.5)  # let the panel's CSS transition settle
+
+        frame = await buf.next_frame(2)
+        frame.save("step5_lang_panel_open.png")
+        print("  → Saved step5_lang_panel_open.png")
+
+        # Step 6: Click "Deutsch" in the now-open language list, by text.
+        # No selector for this one on purpose — it's the text-fallback
+        # path that's being demonstrated here.
+        print("Step 6: Click 'Deutsch' (text fallback)")
+        found = await br.click_element(text="Deutsch")
+        print(f"  → clicked: {found}")
+        await asyncio.sleep(1.0)  # allow navigation to the German article
+
+        frame = await buf.next_frame(2)
+        frame.save("step6_deutsch_page.png")
+        print("  → Saved step6_deutsch_page.png")
 
         del frame  # release the zero-copy view before the buffer closes
 
