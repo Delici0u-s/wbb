@@ -266,26 +266,6 @@ class BrowserBridge:
                 with suppress(Exception):
                     await asyncio.wait_for(loop.run_in_executor(None, self._proc.wait), timeout=2)
 
-    # async def stop(self) -> None:
-    #     """Stop the screencast, close the WebSocket, terminate Chrome."""
-    #     if not self._running:
-    #         return
-    #     self._running = False
-    #     with suppress(Exception):
-    #         await self._send("Page.stopScreencast")
-    #     if self._recv_task:
-    #         self._recv_task.cancel()
-    #         with suppress(asyncio.CancelledError):
-    #             await self._recv_task
-    #     if self._ws:
-    #         await self._ws.close()
-    #     if self._proc:
-    #         self._proc.terminate()
-    #         try:
-    #             self._proc.wait(timeout=5)
-    #         except subprocess.TimeoutExpired:
-    #             self._proc.kill()
-
     async def __aenter__(self) -> "BrowserBridge":
         await self.start()
         return self
@@ -310,16 +290,6 @@ class BrowserBridge:
         await self._ws.send(msg)
         return await fut
 
-    # async def _send(self, method: str, **params: Any) -> Any:
-    #     self._cmd_id += 1
-    #     cid = self._cmd_id
-    #     msg = json.dumps({"id": cid, "method": method, "params": params})
-    #     fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-    #     self._pending[cid] = fut
-    #     assert self._ws
-    #     await self._ws.send(msg)
-    #     return await fut
-
     async def _recv_loop(self) -> None:
         assert self._ws
         async for raw in self._ws:
@@ -327,11 +297,6 @@ class BrowserBridge:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-
-            # debug test
-            # a_s = msg.get("id")
-            # a = msg.get("method", f"<response id={a_s}>")
-            # print(f"[CDP] {a}", file=sys.stderr)  # TEMP
 
             if "id" in msg:
                 fut = self._pending.pop(msg["id"], None)
@@ -363,6 +328,7 @@ class BrowserBridge:
         asyncio.create_task(self._send("Page.screencastFrameAck", sessionId=session_id))
 
         data = params.get("data", "")
+        # print(f"[frame] {time.monotonic():.2f}", file=sys.stderr)
         ts = params.get("metadata", {}).get("timestamp", time.monotonic())
 
         loop = asyncio.get_running_loop()
@@ -374,21 +340,6 @@ class BrowserBridge:
     # ------------------------------------------------------------------
     # Navigation & page control
     # ------------------------------------------------------------------
-
-    # async def navigate(
-    #     self, url: str, *, wait_for_load: bool = True, timeout: float = 30.0
-    # ) -> None:
-    #     """Navigate to *url*. By default, blocks until the page's load event fires."""
-    #     if wait_for_load:
-    #         evt = asyncio.Event()
-    #         self.on("load", lambda: evt.set())
-    #         await self._send("Page.navigate", url=url)
-    #         try:
-    #             await asyncio.wait_for(evt.wait(), timeout=timeout)
-    #         except asyncio.TimeoutError:
-    #             log.warning("navigate() timed out waiting for load after %.1fs", timeout)
-    #     else:
-    #         await self._send("Page.navigate", url=url)
 
     async def navigate(self, url: str) -> None:
         """Navigate to *url* and wait for the page to stop loading."""
@@ -419,15 +370,6 @@ class BrowserBridge:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
         return False
-
-    # async def wait_for_load(self, timeout: float = 30.0) -> None:
-    #     """Block until the page fires its load event."""
-    #     evt: asyncio.Event = asyncio.Event()
-    #     self.on("load", lambda: evt.set())
-    #     try:
-    #         await asyncio.wait_for(evt.wait(), timeout=timeout)
-    #     except asyncio.TimeoutError:
-    #         log.warning("wait_for_load timed out after %.1fs", timeout)
 
     async def set_viewport(self, width: int, height: int) -> None:
         self._width = width
@@ -607,11 +549,6 @@ class BrowserBridge:
             key=key,
             text=text if kind == "keyDown" else "",  # keyUp shouldn't carry text
         )
-
-    # async def key(self, key: str, *, kind: str = "keyDown") -> None:
-    #     """Dispatch a raw key event. *key* is a DOM key value (e.g. 'Enter')."""
-    #     self._require_input()
-    #     await self._send("Input.dispatchKeyEvent", type=kind, key=key)
 
     async def type(self, text: str) -> None:
         """Insert *text* as if typed by the user."""

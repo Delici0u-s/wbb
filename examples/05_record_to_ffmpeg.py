@@ -1,20 +1,15 @@
 """
 05_record_to_ffmpeg.py — Record frames to video via ffmpeg pipe.
-
-Demonstrates:
-  - Fully headless operation (no display window)
-  - Piping raw RGBA frames to an ffmpeg subprocess for video encoding
-  - Arbitrary numpy/cv2-style processing in the recording path
-  - Clean shutdown on KeyboardInterrupt
-
-Requires ffmpeg in PATH. No display window is opened.
 """
 
 import asyncio
 import subprocess
+import sys
+import time
+
 from wbb import BrowserBridge, FrameBuffer
 
-URL = "https://example.com"
+URL = "https://www.clocktab.com/"
 OUTPUT = "recording.mp4"
 WIDTH, HEIGHT = 1280, 720
 FPS = 30
@@ -24,54 +19,85 @@ DURATION_SECONDS = 10
 async def main() -> None:
     buf = FrameBuffer("ex05", WIDTH, HEIGHT)
 
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-pix_fmt", "rgba",
-        "-s", f"{WIDTH}x{HEIGHT}",
-        "-r", str(FPS),
-        "-i", "-",           # read from stdin
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-pix_fmt", "yuv420p",
-        OUTPUT,
-    ]
-
     ffmpeg = subprocess.Popen(
-        ffmpeg_cmd,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-s",
+            f"{WIDTH}x{HEIGHT}",
+            "-r",
+            str(FPS),
+            "-i",
+            "-",
+            "-vf",
+            "scale=in_range=full:out_range=full",
+            "-c:v",
+            "libopenh264",
+            "-pix_fmt",
+            "yuv420p",
+            "-color_range",
+            "pc",
+            "-g",
+            str(FPS),
+            "-movflags",
+            "+faststart",
+            OUTPUT,
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
-    print(f"Recording {DURATION_SECONDS}s of {URL} → {OUTPUT}")
+    print(f"Recording {DURATION_SECONDS}s of {URL} -> {OUTPUT}")
+
     frame_count = 0
-    target_frames = DURATION_SECONDS * FPS
+    load_event = asyncio.Event()
 
-    async with BrowserBridge(buf, width=WIDTH, height=HEIGHT) as br:
-        await br.navigate(URL)
-        await br.wait_for_load()
+    try:
+        async with BrowserBridge(buf, width=WIDTH, height=HEIGHT) as br:
+            br.on("load", lambda: load_event.set())
+            await br.navigate(URL)
+            await asyncio.wait_for(load_event.wait(), timeout=15)
+            await asyncio.sleep(1.5)  # let JS-rendered content settle
 
-        async for frame in buf:
-            if frame_count >= target_frames:
-                break
+            start = time.monotonic()
+            next_slot = 0.0
+            frame_interval = 1.0 / FPS
 
-            # Raw RGBA bytes straight to ffmpeg stdin — no intermediate copy
-            assert ffmpeg.stdin
-            ffmpeg.stdin.write(frame.data.tobytes())
-            frame_count += 1
+            while (elapsed := time.monotonic() - start) < DURATION_SECONDS:
+                frame = buf.read()
+                payload = frame.data.tobytes()
+                del frame
 
-            if frame_count % FPS == 0:
-                elapsed = frame_count // FPS
-                print(f"  {elapsed}/{DURATION_SECONDS}s", end="\r", flush=True)
+                # Real-time pacing: write as many 1/FPS slots as have
+                # elapsed, re-using the latest frame if Chrome hasn't
+                # pushed a new one yet (e.g. during its 1fps idle throttle)
+                while next_slot <= elapsed:
+                    ffmpeg.stdin.write(payload)
+                    frame_count += 1
+                    next_slot += frame_interval
 
-    assert ffmpeg.stdin
-    ffmpeg.stdin.close()
-    ffmpeg.wait()
-    buf.close()
-    buf.unlink()
-    print(f"\nSaved {frame_count} frames → {OUTPUT}")
+                del payload
+                await asyncio.sleep(0.01)
+    finally:
+        if ffmpeg.stdin and not ffmpeg.stdin.closed:
+            ffmpeg.stdin.close()
+        _, stderr_bytes = ffmpeg.communicate(timeout=15)
+        buf.close()
+        buf.unlink()
+
+    if ffmpeg.returncode != 0:
+        print(f"ffmpeg exited with code {ffmpeg.returncode}", file=sys.stderr)
+        print(stderr_bytes.decode(errors="replace")[-3000:], file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Saved {frame_count} frames -> {OUTPUT}")
 
 
 if __name__ == "__main__":

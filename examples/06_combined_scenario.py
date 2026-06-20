@@ -14,11 +14,13 @@ import time
 import numpy as np
 from pathlib import Path
 from wbb import BrowserBridge, FrameBuffer, DisplayClient, filters
+import math
 
-URL = "https://example.com"
+# URL = "https://example.com"
+URL = "https://www.clocktab.com/"
 WIDTH, HEIGHT = 1280, 720
 SNAPSHOTS_DIR = Path("snapshots")
-SNAPSHOT_EVERY_N = 60  # frames
+SNAPSHOT_EVERY_N = 20  # frames
 CHANGE_THRESHOLD = 0.03
 
 
@@ -38,7 +40,7 @@ async def monitor_task(buf: FrameBuffer) -> None:
     """Detect and log visual changes."""
     prev = None
     async for frame in buf:
-        curr = frame.data[:HEIGHT // 2, :WIDTH // 2, :3].astype(np.int16)
+        curr = frame.data[: HEIGHT // 2, : WIDTH // 2, :3].astype(np.int16)
         if prev is not None:
             diff = np.abs(curr - prev).sum(axis=2)
             frac = (diff > 8).sum() / curr.shape[0] / curr.shape[1]
@@ -47,11 +49,31 @@ async def monitor_task(buf: FrameBuffer) -> None:
         prev = curr
 
 
+def rgb_filter(speed: float = 1.0):
+    phase = 0.0
+
+    def _rgb_filter(frame: np.ndarray) -> np.ndarray:
+        nonlocal phase
+
+        phase += speed * 0.05
+
+        r = (math.sin(phase) + 1.0) * 0.5
+        g = (math.sin(phase + 2.0 * math.pi / 3.0) + 1.0) * 0.5
+        b = (math.sin(phase + 4.0 * math.pi / 3.0) + 1.0) * 0.5
+
+        muls = np.array([r, g, b, 1.0], dtype=np.float32)
+
+        return (frame.astype(np.float32) * muls).clip(0, 255).astype(np.uint8)
+
+    return _rgb_filter
+
+
 async def main() -> None:
     buf = FrameBuffer("ex06", WIDTH, HEIGHT)
 
     pipeline = filters.chain(
-        filters.colorize(r=1.0, g=0.9, b=0.9),  # warm tint
+        rgb_filter(1),
+        # filters.colorize(r=1.0, g=0.9, b=0.9),  # warm tint
         filters.contrast(1.1),
     )
 

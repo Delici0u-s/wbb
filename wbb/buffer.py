@@ -152,11 +152,6 @@ class FrameBuffer:
         view.flags.writeable = False
         return Frame(data=view, width=self.width, height=self.height, frame_id=fid, timestamp=ts)
 
-    # def wait_for_frame(self, timeout: Optional[float] = None) -> Frame:
-    #     """Block until the next new frame arrives, then return it."""
-    #     self._new_frame_event.wait(timeout=timeout)
-    #     return self.read()
-
     # ------------------------------------------------------------------
     # Async interface
     # ------------------------------------------------------------------
@@ -169,7 +164,8 @@ class FrameBuffer:
         """
         loop = asyncio.get_running_loop()
         got_frame = await loop.run_in_executor(None, self._new_frame_event.wait, timeout)
-        # got_frame is False on timeout, True if the event was set
+        # print(got_frame)
+        # got_frame is False on timeout, True if the event was set. Can be used later if we want to
         return self.read()
 
     async def __aiter__(self) -> AsyncIterator[Frame]:
