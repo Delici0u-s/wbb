@@ -14,7 +14,8 @@ import asyncio
 import subprocess
 from wbb import BrowserBridge, FrameBuffer
 
-URL = "https://example.com"
+URL = "https://www.clocktab.com/"
+# URL = "https://example.com"
 OUTPUT = "recording.mp4"
 WIDTH, HEIGHT = 1280, 720
 FPS = 30
@@ -25,16 +26,26 @@ async def main() -> None:
     buf = FrameBuffer("ex05", WIDTH, HEIGHT)
 
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-pix_fmt", "rgba",
-        "-s", f"{WIDTH}x{HEIGHT}",
-        "-r", str(FPS),
-        "-i", "-",           # read from stdin
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-pix_fmt", "yuv420p",
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgba",
+        "-s",
+        f"{WIDTH}x{HEIGHT}",
+        "-r",
+        str(FPS),
+        "-i",
+        "-",  # read from stdin
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-pix_fmt",
+        "yuv420p",
         OUTPUT,
     ]
 
@@ -51,8 +62,8 @@ async def main() -> None:
 
     async with BrowserBridge(buf, width=WIDTH, height=HEIGHT) as br:
         await br.navigate(URL)
-        await br.wait_for_load()
 
+        await buf.next_frame(2)
         async for frame in buf:
             if frame_count >= target_frames:
                 break

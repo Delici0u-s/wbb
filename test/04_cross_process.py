@@ -8,7 +8,7 @@ Demonstrates:
 
 Run with two terminals:
     # Terminal A (renderer):
-    python examples/04_cross_process.py renderer https://example.com
+    python examples/04_cross_process.py renderer "https://www.clocktab.com/"
 
     # Terminal B (viewer):
     python examples/04_cross_process.py viewer
@@ -35,7 +35,7 @@ async def run_renderer(url: str) -> None:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
-    
+
     buf.close()
     buf.unlink()
     print("[renderer] Stopped.")
@@ -57,7 +57,7 @@ def main() -> None:
 
     mode = sys.argv[1]
     if mode == "renderer":
-        url = sys.argv[2] if len(sys.argv) > 2 else "https://example.com"
+        url = sys.argv[2] if len(sys.argv) > 2 else "https://www.clocktab.com/"
         try:
             asyncio.run(run_renderer(url))
         except KeyboardInterrupt:
