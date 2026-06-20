@@ -366,18 +366,22 @@ class BrowserBridge:
         )
         return result.get("result", {}).get("value")
 
-    async def wait_for_selector(
-        self, selector: str, *, timeout: float = 10.0, poll_interval: float = 0.15
-    ) -> bool:
-        """Poll the DOM until *selector* matches at least one element."""
-        elapsed = 0.0
-        while elapsed < timeout:
-            found = await self.eval(f"document.querySelector({selector!r}) !== null")
-            if found:
-                return True
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-        return False
+    async def wait_for_selector(self, selector: str, *, timeout: float = 10.0) -> bool:
+        js = f"""
+        new Promise((resolve) => {{
+            const sel = {selector!r};
+            if (document.querySelector(sel)) return resolve(true);
+            const obs = new MutationObserver(() => {{
+                if (document.querySelector(sel)) {{
+                    obs.disconnect();
+                    resolve(true);
+                }}
+            }});
+            obs.observe(document.body, {{ childList: true, subtree: true }});
+            setTimeout(() => {{ obs.disconnect(); resolve(false); }}, {int(timeout * 1000)});
+        }})
+        """
+        return bool(await self.eval(js, await_promise=True))
 
     async def set_viewport(self, width: int, height: int) -> None:
         self._width = width

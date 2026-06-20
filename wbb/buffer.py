@@ -135,36 +135,6 @@ class FrameBuffer:
         # self._new_frame_event.clear()
         return fid
 
-    # def write(self, rgba: np.ndarray) -> int:
-    #     """
-    #     Write *rgba* (H×W×4 uint8) into the inactive buffer, then flip.
-    #
-    #     Returns the new frame_id.
-    #     """
-    #
-    #     if rgba.shape != (self.height, self.width, 4):
-    #         raise ValueError(f"Expected shape ({self.height}, {self.width}, 4), got {rgba.shape}")
-    #
-    #     with self._lock:
-    #         self._frame_counter += 1
-    #         fid = self._frame_counter
-    #         ts = time.monotonic()
-    #         next_idx = self._write_index ^ 1
-    #
-    #         # write into the currently inactive buffer
-    #         target = self._arr_a if next_idx == 0 else self._arr_b
-    #         np.copyto(target, rgba)
-    #
-    #         # update metadata atomically (single byte flip last)
-    #         packed = struct.pack(_META_FMT, next_idx, fid, ts)
-    #         self._shm_meta.buf[:_META_SIZE] = packed
-    #
-    #         self._write_index = next_idx
-    #
-    #     self._new_frame_event.set()
-    #     self._new_frame_event.clear()
-    #     return fid
-
     # ------------------------------------------------------------------
     # Reader interface
     # ------------------------------------------------------------------
@@ -201,18 +171,6 @@ class FrameBuffer:
         seen_gen = self._generation
         await loop.run_in_executor(None, _wait_for_new_generation, seen_gen)
         return self.read()
-
-    # async def next_frame(self, timeout: float = 5.0) -> Frame:
-    #     """Async wait for the next frame.
-    #
-    #     Returns the latest frame via self.read() if no new frame
-    #     arrives within `timeout` seconds.
-    #     """
-    #     loop = asyncio.get_running_loop()
-    #     got_frame = await loop.run_in_executor(None, self._new_frame_event.wait, timeout)
-    #     # print(got_frame)
-    #     # got_frame is False on timeout, True if the event was set. Can be used later if we want to
-    #     return self.read()
 
     async def __aiter__(self) -> AsyncIterator[Frame]:
         while True:
