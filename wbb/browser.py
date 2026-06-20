@@ -42,6 +42,14 @@ import numpy as np
 import websockets
 from PIL import Image
 
+# optional dependency, falls back to Pillow if unavailable
+try:
+    from turbojpeg import TurboJPEG
+
+    _turbo = TurboJPEG()
+except ImportError:
+    _turbo = None
+
 from wbb.buffer import FrameBuffer
 from wbb.frame import Frame
 
@@ -592,6 +600,24 @@ class BrowserBridge:
 def _jpeg_to_rgba(data_b64: str, width: int, height: int) -> np.ndarray:
     """Decode a base64 JPEG payload to an H×W×4 RGBA uint8 array."""
     raw = base64.b64decode(data_b64)
+    if _turbo is not None:
+        bgr = _turbo.decode(raw)
+        if bgr.shape[:2] == (height, width):
+            rgba = np.empty((bgr.shape[0], bgr.shape[1], 4), dtype=np.uint8)
+            rgba[..., 0] = bgr[..., 2]
+            rgba[..., 1] = bgr[..., 1]
+            rgba[..., 2] = bgr[..., 0]
+            rgba[..., 3] = 255
+            return rgba
+        # size mismatch: resize the *decoded* BGR array, don't re-decode with Pillow
+
+        bgr = np.asarray(
+            Image.fromarray(bgr[..., ::-1]).resize((width, height), Image.Resampling.LANCZOS)
+        )
+        rgba = np.empty((height, width, 4), dtype=np.uint8)
+        rgba[..., :3] = bgr
+        rgba[..., 3] = 255
+        return rgba
     img = Image.open(io.BytesIO(raw)).convert("RGBA")
     if img.size != (width, height):
         img = img.resize((width, height), Image.LANCZOS)  # type: ignore[attr-defined]

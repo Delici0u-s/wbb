@@ -93,8 +93,10 @@ class FrameBuffer:
         self._frame_counter: int = 0
 
         # reader notification
-        self._new_frame_event = threading.Event()
+        # self._new_frame_event = threading.Event()
         self._lock = threading.Lock()  # protects _frame_counter on write side
+        self._cv = threading.Condition()
+        self._generation = 0  # bumped on every write, never reset
 
     # ------------------------------------------------------------------
     # Writer interface (called by BrowserBridge)
@@ -126,8 +128,11 @@ class FrameBuffer:
             self._shm_meta.buf[:_META_SIZE] = packed
             self._write_index = next_idx
 
-        self._new_frame_event.set()
-        self._new_frame_event.clear()
+        with self._cv:
+            self._generation += 1
+            self._cv.notify_all()
+        # self._new_frame_event.set()
+        # self._new_frame_event.clear()
         return fid
 
     # def write(self, rgba: np.ndarray) -> int:
@@ -187,16 +192,27 @@ class FrameBuffer:
     # ------------------------------------------------------------------
 
     async def next_frame(self, timeout: float = 5.0) -> Frame:
-        """Async wait for the next frame.
-
-        Returns the latest frame via self.read() if no new frame
-        arrives within `timeout` seconds.
-        """
         loop = asyncio.get_running_loop()
-        got_frame = await loop.run_in_executor(None, self._new_frame_event.wait, timeout)
-        # print(got_frame)
-        # got_frame is False on timeout, True if the event was set. Can be used later if we want to
+
+        def _wait_for_new_generation(seen_gen: int) -> bool:
+            with self._cv:
+                return self._cv.wait_for(lambda: self._generation != seen_gen, timeout=timeout)
+
+        seen_gen = self._generation
+        await loop.run_in_executor(None, _wait_for_new_generation, seen_gen)
         return self.read()
+
+    # async def next_frame(self, timeout: float = 5.0) -> Frame:
+    #     """Async wait for the next frame.
+    #
+    #     Returns the latest frame via self.read() if no new frame
+    #     arrives within `timeout` seconds.
+    #     """
+    #     loop = asyncio.get_running_loop()
+    #     got_frame = await loop.run_in_executor(None, self._new_frame_event.wait, timeout)
+    #     # print(got_frame)
+    #     # got_frame is False on timeout, True if the event was set. Can be used later if we want to
+    #     return self.read()
 
     async def __aiter__(self) -> AsyncIterator[Frame]:
         while True:
