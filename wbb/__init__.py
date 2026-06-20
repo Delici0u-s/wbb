@@ -14,6 +14,7 @@ from wbb.browser import BrowserBridge
 from wbb.buffer import FrameBuffer
 from wbb.frame import Frame
 from wbb.display import DisplayClient
+from wbb.pool import BrowserPool
 from wbb import filters
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "Frame",
     "DisplayClient",
     "filters",
+    "BrowserPool",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
