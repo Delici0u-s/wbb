@@ -399,3 +399,9 @@ MIT
 
 ## personal notes
 pip install "setuptools>=68" wheel "numpy>=1.24" "websockets>=12.0" "Pillow>=10.0" "aiohttp>=3.9" "pygame>2.5"
+rm -rf dist/ build/ *.egg-info
+python -m build
+twine check dist/*
+twine upload dist/*
+git tag v0.1.1
+git push origin v0.1.1
