@@ -393,6 +393,17 @@ on exit (see `wbb/_shm.py` for the CPython issue this works around).
 
 ---
 
+## Changelog
+
+V0.1.1
+- improved performance and fixed bugs
+
+V0.1.2
+- changed header implementation
+
+
+---
+
 ## License
 
 MIT
@@ -400,6 +411,7 @@ MIT
 ## personal notes
 pip install "setuptools>=68" wheel "numpy>=1.24" "websockets>=12.0" "Pillow>=10.0" "aiohttp>=3.9" "pygame>2.5"
 rm -rf dist/ build/ *.egg-info
+update version in pyproject.toml
 python -m build
 twine check dist/*
 twine upload dist/*
