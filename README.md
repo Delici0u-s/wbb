@@ -38,6 +38,7 @@ exposes that buffer as a composable, scriptable async Python primitive.
 ```bash
 pip install wbb                   # core
 pip install "wbb[display]"        # + pygame for DisplayClient
+pip install "wbb[fast-jpeg]"      # + PyTurboJPEG for faster computation.
 ```
 
 ## Quick start

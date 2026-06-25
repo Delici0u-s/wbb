@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from pathlib import Path
@@ -152,6 +153,7 @@ class BrowserBridge:
         screencast_max_fps: int = 30,
         enable_input: Optional[bool] = None,
         headless_args: Optional[list[str]] = None,
+        extra_headers: Optional[dict[str, str]] = None,
     ) -> None:
         self._buf = buffer
         self._width = width
@@ -160,6 +162,13 @@ class BrowserBridge:
         self._sfps = screencast_max_fps
         self._input_enabled = enable_input is not False
         self._extra_args = headless_args or []
+
+        # Header groups: id -> {header_name: value, ...}. Re-merged and
+        # pushed to CDP as a single Network.setExtraHTTPHeaders call on
+        # every add/remove, since the protocol has no incremental API.
+        self._header_groups: dict[str, dict[str, str]] = {}
+        if extra_headers:
+            self._header_groups["__initial__"] = dict(extra_headers)
 
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._ws: Optional[websockets.ClientConnection] = None
@@ -220,6 +229,9 @@ class BrowserBridge:
         await self._send("Runtime.enable")
         await self._send("Network.enable")
         await self._send("Target.setDiscoverTargets", discover=True)
+
+        if self._header_groups:
+            await self._push_headers()
 
         # Set viewport
         await self._send(
@@ -393,6 +405,63 @@ class BrowserBridge:
             deviceScaleFactor=1,
             mobile=False,
         )
+
+    # ------------------------------------------------------------------
+    # Extra HTTP headers
+    # ------------------------------------------------------------------
+    #
+    # CDP's Network.setExtraHTTPHeaders replaces the *entire* header set
+    # on every call — there is no incremental add/remove at the protocol
+    # level. To expose an add/remove API anyway, headers are tracked
+    # locally as named groups (one id -> one dict of headers, added
+    # together and removed together) and the full merged dict is
+    # recomputed and re-sent to CDP on every mutation.
+    #
+    # Merge order is insertion order of the groups; if two groups define
+    # the same header name, the most-recently-added group wins.
+
+    async def _push_headers(self) -> None:
+        merged: dict[str, str] = {}
+        for group in self._header_groups.values():
+            merged.update(group)
+        await self._send("Network.setExtraHTTPHeaders", headers=merged)
+
+    async def header_add(self, headers: dict[str, str]) -> str:
+        """
+        Register a group of one or more extra HTTP headers and push the
+        merged header set to Chrome via CDP.
+
+        Returns an opaque ``id``. Pass it to ``header_remove`` later to
+        remove exactly this group (other groups are unaffected).
+
+        Example
+        -------
+        >>> gid = await bridge.header_add({"X-Trace-Id": "abc123"})
+        >>> await bridge.header_remove(gid)
+        """
+        group_id = uuid.uuid4().hex
+        self._header_groups[group_id] = dict(headers)
+        await self._push_headers()
+        return group_id
+
+    async def header_remove(self, group_id: str) -> None:
+        """Remove a header group by the id returned from ``header_add``,
+        and push the updated header set to Chrome. No-op (does not raise)
+        if the id is unknown."""
+        self._header_groups.pop(group_id, None)
+        await self._push_headers()
+
+    async def header_remove_all(self) -> None:
+        """Clear all extra headers and push the (now empty) set to Chrome."""
+        self._header_groups.clear()
+        await self._push_headers()
+
+    def headers_current(self) -> dict[str, str]:
+        """Return the currently merged header dict (local state, no CDP call)."""
+        merged: dict[str, str] = {}
+        for group in self._header_groups.values():
+            merged.update(group)
+        return merged
 
     # ------------------------------------------------------------------
     # Input (all raise if enable_input=False)
