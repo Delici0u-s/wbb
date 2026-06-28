@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wbb"
-version = "0.1.2"
+version = "0.1.3"
 description = "Render a live website into an off-screen pixel buffer and expose it as a programmable primitive"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,7 +23,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-display = ["pygame>=2.5"]
+# NOTE: gtk4-layer-shell (needed for DisplayClient's layer_shell=True /
+# corner-pinned Wayland window mode) is a system library with its own
+# GObject-introspection typelib, not a pip-installable Python package —
+# there is deliberately no extra for it here, since one would imply pip
+# could satisfy it. Install via the system package manager instead, e.g.
+# `sudo dnf install gtk4-layer-shell` on Fedora. DisplayClient detects its
+# absence at runtime and falls back to a plain window rather than failing.
+display = ["PyGObject>=3.50"]
 fast-jpeg = ["PyTurboJPEG>=1.7"]
 dev = ["pytest", "pytest-asyncio", "mypy", "ruff"]
 
@@ -42,5 +49,5 @@ python_version = "3.10"
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["pygame", "pygame.*", "scipy.*"]
+module = ["gi", "gi.*", "cairo", "scipy.*"]
 ignore_missing_imports = true
