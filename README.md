@@ -463,8 +463,10 @@ pip install "setuptools>=68" wheel "numpy>=1.24" "websockets>=12.0" "Pillow>=10.
 rm -rf dist/ build/ *.egg-info
 # bump version in pyproject.toml and wbb/__init__
 python -m build
+twine check --repository testpypi dist/*
+twine upload --repository testpypi dist/*
 twine check dist/*
 twine upload dist/*
-git tag v0.1.4
-git push origin v0.1.4
+git tag v0.1.4.2
+git push origin v0.1.4.2
 ```
