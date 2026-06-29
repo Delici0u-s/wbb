@@ -248,14 +248,23 @@ class BrowserBridge:
         await self._start_screencast()
 
     async def _start_screencast(self) -> None:
+        every_nth = max(1, round(60 / self._sfps)) if self._sfps else 1
         await self._send(
             "Page.startScreencast",
             format="jpeg",
             quality=self._sq,
             maxWidth=self._width,
             maxHeight=self._height,
-            everyNthFrame=1,
+            everyNthFrame=every_nth,
         )
+        # await self._send(
+        #     "Page.startScreencast",
+        #     format="jpeg",
+        #     quality=self._sq,
+        #     maxWidth=self._width,
+        #     maxHeight=self._height,
+        #     everyNthFrame=1,
+        # )
 
     async def _restart_screencast(self) -> None:
         """Stop and restart the screencast against the current page/viewport.
@@ -354,7 +363,11 @@ class BrowserBridge:
         ``create_task(self._send("...Ack"))`` did.
         """
         self._cmd_id += 1
-        payload: dict[str, Any] = {"id": self._cmd_id, "method": method, "params": params}
+        payload: dict[str, Any] = {
+            "id": self._cmd_id,
+            "method": method,
+            "params": params,
+        }
         if self._session_id is not None:
             payload["sessionId"] = self._session_id
         msg = json.dumps(payload)
@@ -434,7 +447,13 @@ class BrowserBridge:
         loop = asyncio.get_running_loop()
         rgba = await loop.run_in_executor(None, _jpeg_to_rgba, data, self._width, self._height)
         fid = self._buf.write(rgba)
-        frame = Frame(data=rgba, width=self._width, height=self._height, frame_id=fid, timestamp=ts)
+        frame = Frame(
+            data=rgba,
+            width=self._width,
+            height=self._height,
+            frame_id=fid,
+            timestamp=ts,
+        )
         await self._hooks.fire("frame", frame=frame)
 
     # ------------------------------------------------------------------

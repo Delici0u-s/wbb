@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wbb"
-version = "0.1.4"
+version = "0.1.4.1"
 description = "Render a live website into an off-screen pixel buffer and expose it as a programmable primitive"
 readme = "README.md"
 requires-python = ">=3.10"

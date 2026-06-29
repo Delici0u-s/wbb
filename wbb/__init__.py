@@ -26,4 +26,4 @@ __all__ = [
     "BrowserPool",
 ]
 
-__version__ = "0.1.4"
+__version__ = "0.1.4.1"
