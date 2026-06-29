@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wbb"
-version = "0.1.3.3"
+version = "0.1.3.4"
 description = "Render a live website into an off-screen pixel buffer and expose it as a programmable primitive"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,16 +23,46 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# NOTE: gtk4-layer-shell (needed for DisplayClient's layer_shell=True /
-# corner-pinned Wayland window mode) is a system library with its own
-# GObject-introspection typelib, not a pip-installable Python package —
-# there is deliberately no extra for it here, since one would imply pip
-# could satisfy it. Install via the system package manager instead, e.g.
-# `sudo dnf install gtk4-layer-shell` on Fedora. DisplayClient detects its
-# absence at runtime and falls back to a plain window rather than failing.
-display = ["PyGObject>=3.50"]
+# --- Display (the SDL2 window client) -----------------------------------
+# Required to use wbb.display.DisplayClient at all. PyTurboJPEG is strongly
+# recommended for fast JPEG decode but optional (Pillow is the fallback).
+display = ["PySDL2>=0.9.16", "pysdl2-dll>=2.28"]
+
+# --- Window placement backends (optional, platform-specific) ------------
+# Positioning / always-on-top needs a backend that matches your session.
+# Pick the one for your desktop, or use `all` to cover every case.
+#
+#   KDE Plasma (X11 OR Wayland): KWin D-Bus scripting backend.
+#     Needs pydbus + PyGObject. This is the ONLY option on a Wayland
+#     session — Wayland has no client-side window positioning protocol.
+kde = ["pydbus>=0.6", "PyGObject>=3.50"]
+#   Non-KDE X11 desktops (GNOME/X11, XFCE, i3, ...): EWMH backend.
+x11 = ["python-xlib>=0.33"]
+
+# --- Convenience umbrellas ----------------------------------------------
+# Everything needed to run the SDL display with placement working on the
+# common Linux desktops (KDE + generic X11). On a pure Wayland-only box
+# the x11 deps are simply unused; harmless to have installed.
+all = [
+    "PySDL2>=0.9.16",
+    "pysdl2-dll>=2.28",
+    "pydbus>=0.6",
+    "PyGObject>=3.50",
+    "python-xlib>=0.33",
+    "PyTurboJPEG>=1.7",
+]
+
+# --- Other optionals -----------------------------------------------------
 fast-jpeg = ["PyTurboJPEG>=1.7"]
 dev = ["pytest", "pytest-asyncio", "mypy", "ruff"]
+
+# NOTE: gtk4-layer-shell (the old DisplayClient's layer_shell=True /
+# corner-pinned Wayland window mode) is a system library with its own
+# GObject-introspection typelib, NOT a pip-installable Python package, so
+# there is deliberately no extra for it — one would falsely imply pip can
+# satisfy it. Install via the system package manager (e.g.
+# `sudo dnf install gtk4-layer-shell` on Fedora). The SDL DisplayClient
+# does not need it; it uses the placement backends above instead.
 
 [project.scripts]
 wbb = "wbb.__main__:main"

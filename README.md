@@ -15,15 +15,35 @@ System requirements:
 - **Chrome or Chromium** on `PATH` (checked names: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`; common macOS/Windows install paths are also checked). Override with the `CHROME_PATH` environment variable.
 - **ffmpeg**, only if you pipe frames to it yourself (see `examples/05_record_to_ffmpeg.py`). Not a library dependency.
 
-Optional extras:
+### Optional extras
+
+Each extra maps to a specific capability. The display window and the placement backends are optional and platform-specific, so pick the one that matches your desktop.
 
 ```bash
-pip install wbb[display]    # PyGObject, for legacy GTK4 layer-shell display mode
-pip install wbb[fast-jpeg]  # PyTurboJPEG, faster screencast JPEG decoding
-pip install wbb[dev]        # pytest, mypy, ruff
+pip install 'wbb[display]'    # PySDL2 + pysdl2-dll — the SDL2 DisplayClient window
+pip install 'wbb[kde]'        # pydbus + PyGObject — KWin placement backend (KDE, X11 OR Wayland)
+pip install 'wbb[x11]'        # python-xlib — EWMH placement backend (non-KDE X11 desktops)
+pip install 'wbb[fast-jpeg]'  # PyTurboJPEG — much faster screencast JPEG decode
+pip install 'wbb[all]'        # display + both placement backends + fast-jpeg
+pip install 'wbb[dev]'        # pytest, mypy, ruff
 ```
 
-`wbb.display` (the SDL2 `DisplayClient`) also needs **PySDL2** and the **SDL2** system library. Neither is pulled in by any extra above, so install them yourself (`pip install pysdl2` plus your OS's `libsdl2` package). The KWin placement backend needs `pydbus`; the X11/EWMH backend needs `python-xlib`. Both are optional. `DisplayClient` falls back to a plain, unpositioned window if neither is present.
+Quote the brackets (`'wbb[kde]'`) — some shells (zsh) treat them as globs otherwise.
+
+**Which placement extra do I need?** Positioning and always-on-top require a backend that matches your live session:
+
+| Session | Extra | Backend |
+|---|---|---|
+| KDE Plasma (X11 or Wayland) | `wbb[kde]` | KWin D-Bus scripting |
+| GNOME/X11, XFCE, i3, other X11 | `wbb[x11]` | X11 / EWMH |
+| GNOME Wayland, other non-KDE Wayland | *(none available)* | no-op — see below |
+| Not sure | `wbb[all]` | best available |
+
+If no matching backend is installed (or available), `DisplayClient` still runs — it just falls back to a plain, compositor-placed window and logs **one** warning at startup telling you exactly which package to install, with a copy-pasteable command targeting your current interpreter (so it works inside a venv).
+
+> **Wayland reality check.** Wayland has no protocol for a client to set its own absolute position or stay-on-top. On KDE Wayland the *only* mechanism is the KWin scripting backend (`wbb[kde]`). On non-KDE Wayland (e.g. GNOME) there is currently no positioning backend at all — run under an X11/XWayland session if you need precise placement there.
+
+> **Note on the SDL2 system library.** `pip install 'wbb[display]'` pulls in `pysdl2-dll`, which bundles the SDL2 binaries, so you usually don't need a system `libsdl2`. If you prefer your distro's SDL2, install PySDL2 without the bundled DLL and provide `libsdl2` yourself.
 
 ## Quickstart
 
@@ -48,7 +68,7 @@ asyncio.run(main())
 - CDP screencast capture, no screenshot polling
 - Shared-memory double-buffer with zero-copy frame reads
 - Cross-process display: render in one process, view in another
-- Composable filter pipelines (crop, scale, color, blur, custom)
+- Composable filter pipelines (crop, scale, color, blur, custom), with adjacent color filters fused into a single lookup table
 - SDL2 window with always-on-top, absolute position, and click-through, where the desktop supports it
 - DOM-aware interaction: `wait_for_selector`, `click_element` (selector or text fallback)
 - Browser process pooling for reuse across multiple sites
@@ -92,6 +112,8 @@ del frame  # release the view
 
 Blocks, without busy-polling (backed by a `threading.Condition`), until a frame newer than the last one observed arrives, or `timeout` seconds pass, then returns `read()`. On timeout it does **not** raise or return `None`. It just returns whatever is currently committed, so repeated calls under a slow or idle screencast are harmless.
 
+The blocking wait runs on a small dedicated thread pool owned by the buffer, *not* asyncio's shared default executor. This matters under load: the default executor is also where `BrowserBridge` runs JPEG decode, so parking readers there could starve the decoder when many consumers wait at once. The dedicated pool keeps the two from competing.
+
 ```python
 frame = await buf.next_frame(2)  # wait up to 2s for a new frame
 ```
@@ -102,7 +124,7 @@ Infinite async iterator, equivalent to calling `next_frame()` in a loop with the
 
 ##### `FrameBuffer.close() -> None`
 
-Releases this process's own memory mappings. **Drop every `Frame` (and any array derived from one, e.g. via `.crop()`) before calling this.** CPython won't unmap memory while a buffer-protocol export is still live on it, the same rule `mmap` follows generally. If a view is still outstanding, `close()` logs a debug message and returns instead of raising. The segment releases once you drop the last reference and GC runs.
+Releases this process's own memory mappings, wakes any parked `next_frame()` waiter, and shuts down the buffer's wait pool. **Drop every `Frame` (and any array derived from one, e.g. via `.crop()`) before calling this.** CPython won't unmap memory while a buffer-protocol export is still live on it, the same rule `mmap` follows generally. If a view is still outstanding, `close()` logs a debug message and returns instead of raising. The segment releases once you drop the last reference and GC runs.
 
 ##### `FrameBuffer.unlink() -> None`
 
@@ -145,7 +167,7 @@ frame.crop(0, 0, 640, 360).save("corner.png")
 
 #### `class BrowserBridge(buffer, *, width=1280, height=720, screencast_quality=80, screencast_max_fps=30, enable_input=None, headless_args=None, extra_headers=None)`
 
-Owns one headless Chrome process and its CDP WebSocket connection. Frames arrive via `Page.startScreencast` push, no polling. Each JPEG payload is decoded to RGBA off the event loop (PyTurboJPEG if installed, else Pillow) and written into `buffer`.
+Owns one headless Chrome process and its CDP WebSocket connection. Frames arrive via `Page.startScreencast` push, no polling. Each JPEG payload is decoded to RGBA off the event loop and written into `buffer`. With PyTurboJPEG installed, decode goes straight to RGBA in a single libjpeg-turbo pass (no intermediate channel-shuffle copy); without it, Pillow is the fallback.
 
 - **Parameters**
   - `buffer: FrameBuffer` — destination for decoded frames.
@@ -163,7 +185,7 @@ async with BrowserBridge(buf, width=1280, height=720, enable_input=True) as br:
 
 ##### `await BrowserBridge.start()` / `await BrowserBridge.stop()`
 
-Manual lifecycle pair behind the `async with` context manager. `start()` launches Chrome, attaches a flattened CDP session to its `about:blank` page target, enables `Page`/`Runtime`/`Network`, pushes any seeded headers, sets the viewport, and starts the screencast. `stop()` stops the screencast, cancels the receive loop, closes the socket, and terminates (then kills, if unresponsive after 5s) the Chrome process.
+Manual lifecycle pair behind the `async with` context manager. `start()` launches Chrome, attaches a flattened CDP session to its `about:blank` page target, enables `Page`/`Runtime`/`Network`, pushes any seeded headers, sets the viewport, and starts the screencast. `stop()` stops the screencast, drains any in-flight frame decode/write tasks, cancels the receive loop, closes the socket, and terminates (then kills, if unresponsive after 5s) the Chrome process.
 
 ##### `await BrowserBridge.navigate(url: str) -> None`
 
@@ -250,13 +272,15 @@ The buffer this bridge writes into.
 
 Reuses warm Chrome processes across `BrowserBridge` instances instead of paying full process-launch cost per site.
 
+What pooling saves is the dominant cost — launching Chrome and completing the CDP attach/enable handshake. What it does **not** reclaim is renderer memory: Chrome does not shrink its heap back down after a heavy page, so a pool of `max_idle` warm processes is also a pool of `max_idle` peak-RSS processes. Use a smaller `max_idle` (or `0` to disable reuse) if resting memory matters more than launch latency. `acquire` is reuse-or-spawn and does not cap concurrent live bridges — `max_idle` bounds the resting footprint, not the peak.
+
 ##### `await BrowserPool.acquire(buffer: FrameBuffer, **kwargs) -> BrowserBridge`
 
-Pops an idle bridge if one exists: rebinds it to `buffer`, navigates it to `about:blank`, updates the viewport if `width`/`height` are in `kwargs`. Otherwise constructs and starts a fresh `BrowserBridge(buffer, **kwargs)`.
+Pops an idle bridge if one exists: rebinds it to `buffer`, applies the requested viewport (if `width`/`height` are in `kwargs`), navigates it to `about:blank`, and restarts its screencast against the new consumer. Otherwise constructs and starts a fresh `BrowserBridge(buffer, **kwargs)`.
 
 ##### `await BrowserPool.release(br: BrowserBridge) -> None`
 
-Returns `br` to the idle pool (navigating it to `about:blank` first) if there's room under `max_idle`; otherwise calls `br.stop()`.
+Returns `br` to the idle pool if there's room under `max_idle`: it clears the previous owner's event hooks, pauses the screencast (so a parked bridge isn't decoding blank frames into a detached buffer), and navigates to `about:blank`. If the pool is full, calls `br.stop()` instead.
 
 ```python
 pool = BrowserPool(max_idle=3)
@@ -284,26 +308,37 @@ Every filter has the signature `(np.ndarray) -> np.ndarray` over an H×W×4 `uin
 | `chain` | `chain(*filters) -> Filter` | Left-to-right composition of any number of filters. |
 | `identity` | `identity() -> Filter` | Pass-through. |
 
+**Color filter fusion.** `colorize`, `brightness`, and `contrast` are per-channel point operations, implemented as 256-entry lookup tables rather than per-frame float math. When you `chain` (or `compose`) adjacent color filters, their tables are fused at build time into a *single* lookup, so a run of color filters costs one table gather per frame regardless of how many you stacked. A non-color filter (`crop`, `scale`, `blur`, `grayscale`, `flip`, or a custom one) breaks the run; fusion resumes after it. This is transparent — the chained result is bit-identical to applying the filters one at a time.
+
 ```python
+# These three fuse into one lookup table:
 pipeline = filters.chain(
     filters.colorize(r=0.95, g=0.95, b=1.1),
     filters.contrast(1.1),
+    filters.brightness(8),
+)
+
+# Here the crop breaks the run; colorize and contrast still fuse with each other:
+pipeline = filters.chain(
+    filters.colorize(r=1.1),
+    filters.contrast(1.2),
+    filters.crop(0, 0, 640, 360),
 )
 ```
 
 ### `wbb.display` (SDL2 `DisplayClient`)
 
-Requires PySDL2 plus system SDL2 (see Installation). Renders a `FrameBuffer` into a window, running everything (SDL event polling and frame pull) as a single coroutine on the caller's own asyncio loop. No second thread, no second main loop.
+Requires the `display` extra (PySDL2 + SDL2). Renders a `FrameBuffer` into a window, running everything (SDL event polling and frame pull) as a single coroutine on the caller's own asyncio loop. No second thread, no second main loop. Filters run off-loop in a thread pool, and frames are uploaded to the GPU via `SDL_LockTexture` (writing straight into the texture's staging memory).
 
-#### `class DisplayClient(buffer, *, title="wbb", wm_class="wbb-display", filters=None, on_mouse_event=None, on_key_event=None, on_scroll_event=None, window_size=None, position=(0, 0), monitor=0, always_on_top=False, borderless=False, click_through=False, max_fps=60.0)`
+#### `class DisplayClient(buffer, *, title="wbb", wm_class="wbb-display", filters=None, on_mouse_event=None, on_key_event=None, on_scroll_event=None, window_size=None, position=None, monitor=None, always_on_top=False, borderless=False, click_through=False, max_fps=60.0)`
 
 - **Parameters**
   - `buffer` — anything with `.width`, `.height`, and an async `next_frame(timeout)` (i.e. a `FrameBuffer`).
-  - `wm_class: str` — give each concurrent `DisplayClient` a distinct value. The KWin and X11 placement backends match windows by this.
+  - `wm_class: str` — give each concurrent `DisplayClient` a distinct value. The KWin and X11 placement backends match windows by this. It's set as both the X11 `WM_CLASS` and the Wayland app-id, so matching works on either session type.
   - `filters: list[Filter] | None` — run in a thread-pool executor, not inline on the event loop, so a slow chain (Pillow resize, scipy blur) never stalls CDP receive or input dispatch.
-  - `position: tuple[int, int]` — **monitor-local**, not global-desktop. Must be a 2-tuple of `int`; raises `ValueError` otherwise.
-  - `monitor: int` — index into `list_displays()` that `position` is local to. Index order is whatever the OS reports, not guaranteed left-to-right. Call `list_displays()` to check.
-  - `always_on_top, borderless` — best-effort. Silently no-op if no placement backend supports them on the current session. `borderless` is unconditional (`SDL_WINDOW_BORDERLESS` at window creation) and always works.
+  - `position: tuple[int, int] | None` — see the coordinate model below. `None` (default) means **no position requested** — the compositor places the window naturally. When given, it must be a 2-tuple of `int` (raises `ValueError` otherwise).
+  - `monitor: int | None` — selects how `position` is interpreted. `None` (default): `position` is a **global virtual-desktop** pixel. An `int`: `position` is **local to that monitor**, an index into `list_displays()`. See the coordinate model below.
+  - `always_on_top, borderless` — best-effort. `always_on_top` silently no-ops if no placement backend supports it on the current session. `borderless` is unconditional (`SDL_WINDOW_BORDERLESS` at window creation) and always works.
   - `click_through: bool` — real on X11 sessions (via the Shape extension's input region); a clean, logged no-op under KWin's Wayland scripting backend, which has no input-transparency mechanism at all. Check `is_click_through_active()` to know which happened.
   - `max_fps: float` — caps how often frames are pushed (gates entry into the filter chain, not just the final present). `0` disables the cap.
 
@@ -312,23 +347,60 @@ display = DisplayClient(buf, title="wbb: filtered view", filters=pipeline, windo
 await display.run_async()
 ```
 
+#### Coordinate model (read this before setting `position`)
+
+There is one coordinate space every placement backend actually consumes: SDL's **global virtual-desktop** space, where each monitor has an origin that may be offset from `(0, 0)`. A monitor to the left of your primary has a negative `x`; a taller monitor sitting below a shorter one mounted higher has a positive `y`. `list_displays()` reports each monitor's real origin and size.
+
+`DisplayClient` lets you address that space two ways:
+
+- **Global mode (`monitor=None`, the default):** `position` is an absolute desktop pixel, placeable anywhere across all monitors. This is the most predictable choice on offset multi-monitor layouts — what you pass is exactly what the compositor receives. Compute your target from `list_displays()`:
+
+  ```python
+  from wbb.display import DisplayClient, list_displays
+
+  d = list_displays()[0]                      # your chosen monitor
+  gx = d.x + 20                               # 20px in from its left edge
+  gy = d.y + d.height - win_h - 20            # 20px up from its bottom edge
+  display = DisplayClient(buf, position=(gx, gy), monitor=None, window_size=(win_w, win_h))
+  ```
+
+- **Monitor-local mode (`monitor=<int>`):** `position` is local to that monitor's origin, which `DisplayClient` adds for you. `monitor=0` does **not** guarantee your leftmost or primary monitor — index order is whatever the OS reports. Check each `list_displays()` entry's `.x`/`.y`/`.width`/`.height`.
+
+  ```python
+  # bottom-left corner of monitor index 1, in that monitor's own pixels:
+  display = DisplayClient(buf, position=(0, mon1_h - win_h), monitor=1)
+  ```
+
 ##### `await DisplayClient.run_async() -> None` / `DisplayClient.run() -> None`
 
 `run_async()` opens the window and runs until `stop()` is called, the user closes the window, or `next_frame()` errors out. `run()` is a sync wrapper (`asyncio.run(self.run_async())`) for non-async call sites.
 
-**XWayland first-map race, and why placement is retried:** on KWin/XWayland, a freshly created toplevel isn't guaranteed to have finished its first map/configure round-trip with the compositor the instant `SDL_CreateWindow` returns. A position-setting `XConfigureWindow` sent before that round-trip completes can be silently superseded by the compositor's own initial placement once it actually maps the window. `always_on_top` (sent as an EWMH client message, which gets queued and redelivered) is unaffected, but absolute `position` is. The fix: `DisplayClient` re-applies `always_on_top`/`position` for the first 5 render-loop iterations. Not a fixed sleep, since the right delay depends on the machine and compositor. This costs a handful of extra D-Bus/Xlib round-trips, only during startup.
+**Startup placement retry.** A freshly created toplevel isn't guaranteed to have finished its first map/configure round-trip with the compositor the instant `SDL_CreateWindow` returns, so an early placement request can be superseded by the compositor's own initial placement. To cover this, `DisplayClient` re-applies `always_on_top`/`position` for the first few render-loop iterations rather than relying on a fixed sleep. This costs a handful of extra D-Bus/Xlib round-trips, only during startup.
 
 ##### `DisplayClient.stop() -> None`
 
 Sets a flag the running `run_async()` loop checks every iteration.
 
-##### `DisplayClient.set_position(position, *, monitor=None) -> None`
+##### `DisplayClient.set_position(position, position_y=None, *, monitor=...) -> None`
 
-Moves the window after startup. No-op if called before `run_async()` has created the window. Re-arms the placement retry window (5 frames) to also cover monitor hot-plug or compositor-reset edge cases.
+Moves the window after startup. Accepts either a single `(x, y)` tuple or two separate ints:
+
+```python
+display.set_position((100, 200))
+display.set_position(100, 200)
+```
+
+The `monitor` argument selects the coordinate mode:
+
+- Omit it — keep whatever mode is currently in effect (global by default).
+- `monitor=None` — explicitly use global virtual-desktop coordinates.
+- `monitor=<int>` — `position` is local to that monitor.
+
+No-op if called before `run_async()` has created the window. Re-arms the placement retry window to also cover monitor hot-plug or compositor-reset edge cases.
 
 ##### `DisplayClient.get_position() -> WindowPosition`
 
-Returns the last-*requested* monitor-local position, not necessarily the resolved global coordinate actually sent to the backend. `WindowPosition` is a frozen dataclass with `x`, `y`.
+Returns the last-*requested* position in whatever convention was last used (global by default, or monitor-local if an int monitor was set), not necessarily the resolved global coordinate actually sent to the backend. `WindowPosition` is a frozen dataclass with `x`, `y`.
 
 ##### `DisplayClient.set_always_on_top(above: bool) -> None`
 
@@ -342,9 +414,17 @@ Query the currently active placement backend's real capabilities, post-startup.
 
 ##### `wbb.display.list_displays() -> list[DisplayBounds]`
 
-Enumerates monitors via `SDL_GetDisplayBounds`. Safe to call before any window exists. `DisplayBounds` is a frozen dataclass: `index, x, y, width, height`. `x`/`y` are in SDL's single global virtual-desktop coordinate space (a monitor to the left of your primary can have a negative `x`), which is also what every placement backend expects. This is why `position=`/`monitor=` exist, so you don't have to compute global coordinates yourself.
+Enumerates monitors via `SDL_GetDisplayBounds`. Safe to call before any window exists. `DisplayBounds` is a frozen dataclass: `index, x, y, width, height`. `x`/`y` are in SDL's single global virtual-desktop coordinate space (a monitor to the left of your primary can have a negative `x`), which is also what every placement backend expects.
 
-**Placement backend chain** (`wbb.display.placement`, not typically used directly): tried in order. KWin D-Bus scripting first (works on Plasma regardless of X11/Wayland; requires `pydbus`), then X11/EWMH (`_NET_WM_STATE_ABOVE` plus `XMoveWindow`/Shape extension for click-through; requires `python-xlib`; naturally inert under Wayland), then a terminal no-op fallback that logs once and makes `always_on_top`/`position`/`click_through` silently do nothing. Each backend is required to fail cleanly rather than raise. An unexpected exception is caught and treated as a declined activation.
+#### Placement backends
+
+`wbb.display.placement` (not typically used directly) selects a backend in priority order and keeps the first that activates:
+
+1. **KWin D-Bus scripting** — KDE Plasma, X11 *or* Wayland. Sets geometry and `keepAbove` through KWin's own scripting interface over the session bus. Requires `pydbus` + `PyGObject` (`wbb[kde]`). On a Wayland session this is the only backend that can position windows. Has no input-transparency mechanism, so `click_through` is a logged no-op here.
+2. **X11 / EWMH** — non-KDE X11 desktops. Positions via the `_NET_MOVERESIZE_WINDOW` client message (which window managers honor for managed windows, unlike a raw `XConfigureWindow`), sets `_NET_WM_STATE_ABOVE`, and does click-through via the Shape extension. Requires `python-xlib` (`wbb[x11]`). Naturally inert under Wayland (no X11 display to open).
+3. **No-op fallback** — anything else (non-KDE Wayland, macOS, Windows, or a KDE box with the deps missing). Logs **one** warning at startup that names the exact package and `pip` command for your detected session and current interpreter, then makes `always_on_top`/`position`/`click_through` silently do nothing.
+
+Each backend is required to fail cleanly rather than raise; an unexpected exception is caught and treated as a declined activation.
 
 ## Examples
 
@@ -358,6 +438,15 @@ The `examples/` directory in the source repository is the practical reference fo
 - **`05_record_to_ffmpeg.py`**: pipes raw RGBA frames into an `ffmpeg` subprocess at a fixed FPS with real-time pacing.
 - **`06_combined_scenario.py`**: one `FrameBuffer` shared concurrently by a live `DisplayClient`, a PNG-snapshot recorder, and a change monitor.
 - **`07_display_multiple_sites_with_pool.py`**: `BrowserPool` driving several sites at once, composited into a single grid and shown through one `DisplayClient`.
+- **`08_clip_display_to_element.py`**: crops the display to a single page element's bounding box.
+
+## Troubleshooting placement
+
+If `always_on_top`/`set_position()` seem to do nothing, the startup log says why and what to install — read that first. Common cases:
+
+- **"no backend available … Wayland session":** you're on non-KDE Wayland, where client-side positioning isn't possible. On KDE Wayland, install `wbb[kde]`. Elsewhere, use an X11/XWayland session.
+- **Installed the dep but still no effect, inside a venv:** make sure it landed in *this* environment. `pip install pydbus` can go to your user site (`~/.local`) where the venv won't see it. The startup warning prints a command using your current interpreter — use that exact line. Verify with `python -c "import pydbus, gi"` (KWin) or `python -c "import Xlib"` (X11) from the same Python that runs your app.
+- **Window won't move past a monitor edge on KDE:** make sure you're passing a global coordinate that actually falls inside a monitor (`monitor=None` plus a target computed from `list_displays()`), not a value that lands off all displays.
 
 ## License
 
@@ -367,12 +456,17 @@ MIT. See `LICENSE`.
 
 Issues and pull requests welcome. For non-trivial changes, open an issue first to discuss the approach.
 
-## personal notes
+## Maintainer notes (publishing)
+
+```bash
 pip install "setuptools>=68" wheel "numpy>=1.24" "websockets>=12.0" "Pillow>=10.0" "aiohttp>=3.9" "PyGObject>=3.50" "PyTurboJPEG>=1.7"
 rm -rf dist/ build/ *.egg-info
-update version in pyproject.toml
+# bump version in pyproject.toml  (keep code + tag in sync — a mismatched
+# install where pip metadata and the on-disk __version__ disagree is a
+# real source of "my fix isn't taking" confusion)
 python -m build
 twine check dist/*
 twine upload dist/*
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.3.4
+git push origin v0.1.3.4
+```
