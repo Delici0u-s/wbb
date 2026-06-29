@@ -461,12 +461,10 @@ Issues and pull requests welcome. For non-trivial changes, open an issue first t
 ```bash
 pip install "setuptools>=68" wheel "numpy>=1.24" "websockets>=12.0" "Pillow>=10.0" "aiohttp>=3.9" "PyGObject>=3.50" "PyTurboJPEG>=1.7"
 rm -rf dist/ build/ *.egg-info
-# bump version in pyproject.toml  (keep code + tag in sync — a mismatched
-# install where pip metadata and the on-disk __version__ disagree is a
-# real source of "my fix isn't taking" confusion)
+# bump version in pyproject.toml and wbb/__init__
 python -m build
 twine check dist/*
 twine upload dist/*
-git tag v0.1.3.4
-git push origin v0.1.3.4
+git tag v0.1.4
+git push origin v0.1.4
 ```
