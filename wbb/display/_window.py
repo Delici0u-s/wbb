@@ -183,7 +183,21 @@ class SDLWindow:
         # backends match against (see placement/kwin.py,
         # placement/x11_ewmh.py), so it has to be stable and set early,
         # not relabeled after the fact.
-        sdl2.SDL_SetHint(b"SDL_VIDEO_X11_WMCLASS", wm_class.encode())
+        #
+        # X11 and Wayland use DIFFERENT SDL hints for the class/app-id,
+        # and which one matters depends on the subsystem SDL2 selects at
+        # runtime (x11 vs native wayland). Set BOTH so the window's
+        # resourceClass / app-id is `wm_class` either way — otherwise, on
+        # a native Wayland session, KWin's `resourceClass == wmClass`
+        # match in the scripting backend finds nothing and positioning
+        # silently no-ops even with pydbus installed.
+        wmc = wm_class.encode()
+        sdl2.SDL_SetHint(b"SDL_VIDEO_X11_WMCLASS", wmc)
+        # SDL_VIDEO_WAYLAND_WMCLASS exists on newer SDL2; SDL_APP_ID is the
+        # broader name. Set whichever the installed SDL exposes (both are
+        # harmless no-ops if unrecognised by this SDL build).
+        sdl2.SDL_SetHint(b"SDL_VIDEO_WAYLAND_WMCLASS", wmc)
+        sdl2.SDL_SetHint(b"SDL_APP_ID", wmc)
 
         flags = sdl2.SDL_WINDOW_SHOWN
         if borderless:

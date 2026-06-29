@@ -104,13 +104,14 @@ _SET_ABOVE_BODY = "w.keepAbove = %(above)s;"
 
 _SET_GEOMETRY_BODY = (
     "var gx = %(x)d, gy = %(y)d, gw = %(width)d, gh = %(height)d;\n"
-    "    // 1) Move the window onto whichever output actually contains the\n"
-    "    //    target top-left, BEFORE setting geometry. KWin constrains a\n"
-    "    //    frameGeometry assignment to the window's *current* output's\n"
-    "    //    area, so if we don't move outputs first, a target on another\n"
-    "    //    monitor (or in that monitor's offset region) gets clamped\n"
-    "    //    back. workspace.screens carries each output's global-coord\n"
-    "    //    geometry; pick the one whose rect contains (gx, gy).\n"
+    '    print("wbb kwin: found window, caption=" + w.caption +\n'
+    '          " class=" + w.resourceClass +\n'
+    '          " before geom=(" + w.frameGeometry.x + "," + w.frameGeometry.y +\n'
+    '          " " + w.frameGeometry.width + "x" + w.frameGeometry.height + ")");\n'
+    "\n"
+    "    // Move the window onto whichever output contains the target,\n"
+    "    // BEFORE setting geometry (KWin constrains a frameGeometry set to\n"
+    "    // the window's current output area).\n"
     "    try {\n"
     "        var screens = workspace.screens || [];\n"
     "        for (var s = 0; s < screens.length; s++) {\n"
@@ -121,23 +122,31 @@ _SET_GEOMETRY_BODY = (
     "                break;\n"
     "            }\n"
     "        }\n"
-    "    } catch (e) { /* older KWin without workspace.screens/output: skip */ }\n"
+    '    } catch (e) { print("wbb kwin: output-move skipped: " + e); }\n'
     "\n"
-    "    // 2) Set position by MUTATING frameGeometry's sub-properties\n"
-    "    //    rather than assigning a whole new rect object. On Plasma 6's\n"
-    "    //    QJSEngine the whole-object assignment (w.frameGeometry = {..})\n"
-    "    //    is unreliable/ignored for the position component; mutating\n"
-    "    //    .x/.y/.width/.height in place is the form that actually\n"
-    "    //    takes (see KDE Discuss reports on frameGeometry read-only\n"
-    "    //    behavior). Fall back to geometry / whole-object only if\n"
-    "    //    frameGeometry isn't present.\n"
-    "    if (\"frameGeometry\" in w) {\n"
+    "    // Try several geometry-setting forms; KWin versions differ in\n"
+    "    // which one actually takes. Each is wrapped so one failing does\n"
+    "    // not abort the rest.\n"
+    "    // Form A: mutate frameGeometry sub-properties in place.\n"
+    "    try {\n"
     "        var fg = w.frameGeometry;\n"
-    "        fg.width = gw; fg.height = gh; fg.x = gx; fg.y = gy;\n"
-    "        w.frameGeometry = fg;  // write-back too, covers both engines\n"
-    "    } else {\n"
-    "        w.geometry = { x: gx, y: gy, width: gw, height: gh };\n"
-    "    }"
+    "        fg.x = gx; fg.y = gy; fg.width = gw; fg.height = gh;\n"
+    '    } catch (e) { print("wbb kwin: form A failed: " + e); }\n'
+    "    // Form B: assign a whole rect object to frameGeometry.\n"
+    "    try {\n"
+    "        w.frameGeometry = { x: gx, y: gy, width: gw, height: gh };\n"
+    '    } catch (e) { print("wbb kwin: form B failed: " + e); }\n'
+    "    // Form C: legacy .geometry property.\n"
+    "    try {\n"
+    '        if ("geometry" in w) { w.geometry = { x: gx, y: gy, width: gw, height: gh }; }\n'
+    '    } catch (e) { print("wbb kwin: form C failed: " + e); }\n'
+    "    // Form D: frameGeometry via moveResize / move (newer KWin scripting).\n"
+    "    try {\n"
+    '        if (typeof w.move === "function") { w.move(gx, gy); }\n'
+    '    } catch (e) { print("wbb kwin: form D failed: " + e); }\n'
+    "\n"
+    '    print("wbb kwin: after geom=(" + w.frameGeometry.x + "," + w.frameGeometry.y +\n'
+    '          " " + w.frameGeometry.width + "x" + w.frameGeometry.height + ")");'
 )
 
 
@@ -210,9 +219,7 @@ class KWinPlacement:
     def set_position(self, x: int, y: int, width: int, height: int) -> None:
         if not self._active:
             return
-        self._run_command(
-            _SET_GEOMETRY_BODY % {"x": x, "y": y, "width": width, "height": height}
-        )
+        self._run_command(_SET_GEOMETRY_BODY % {"x": x, "y": y, "width": width, "height": height})
 
     def supports_position(self) -> bool:
         return self._active
@@ -298,4 +305,3 @@ class KWinPlacement:
                 "bounded, not a leak that grows per-call).",
                 self._script_path,
             )
-
