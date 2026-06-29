@@ -37,7 +37,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union, overload
 
 import numpy as np
 import websockets
@@ -45,11 +45,12 @@ from PIL import Image
 
 # optional dependency, falls back to Pillow if unavailable
 try:
-    from turbojpeg import TurboJPEG
+    from turbojpeg import TJPF_RGBA, TurboJPEG
 
     _turbo = TurboJPEG()
 except ImportError:
     _turbo = None
+    TJPF_RGBA = None  # type: ignore[assignment]
 
 from wbb.buffer import FrameBuffer
 from wbb.frame import Frame
@@ -177,6 +178,7 @@ class BrowserBridge:
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._hooks = _HookRegistry()
         self._recv_task: Optional[asyncio.Task[None]] = None
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._running = False
 
     # ------------------------------------------------------------------
@@ -243,6 +245,9 @@ class BrowserBridge:
         )
 
         # Start screencast
+        await self._start_screencast()
+
+    async def _start_screencast(self) -> None:
         await self._send(
             "Page.startScreencast",
             format="jpeg",
@@ -251,6 +256,26 @@ class BrowserBridge:
             maxHeight=self._height,
             everyNthFrame=1,
         )
+
+    async def _restart_screencast(self) -> None:
+        """Stop and restart the screencast against the current page/viewport.
+
+        Used by the pool on reuse: a bridge that was paused on
+        about:blank needs its screencast re-pointed at the new viewport
+        and re-started so the new consumer actually receives pushes.
+        """
+        with suppress(Exception):
+            await self._send("Page.stopScreencast")
+        await self._start_screencast()
+
+    def _clear_hooks(self) -> None:
+        """Drop all registered event callbacks.
+
+        The pool calls this on release so a reused bridge doesn't keep
+        firing the previous owner's ``frame``/``load``/etc. callbacks at
+        the next, unrelated consumer.
+        """
+        self._hooks = _HookRegistry()
 
     def _read_devtools_url(self) -> str:
         """Parse Chrome stderr for 'DevTools listening on ws://...'"""
@@ -268,6 +293,12 @@ class BrowserBridge:
         self._running = False
         with suppress(Exception):
             await self._send("Page.stopScreencast")
+        # Drain any in-flight screencast decode/write tasks so we don't
+        # cancel a FrameBuffer write half-done. Bounded — screencast is
+        # stopped, so no new ones arrive; give them a moment to finish.
+        if self._bg_tasks:
+            with suppress(Exception):
+                await asyncio.wait(set(self._bg_tasks), timeout=2)
         if self._recv_task:
             self._recv_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -310,6 +341,26 @@ class BrowserBridge:
         await self._ws.send(msg)
         return await fut
 
+    async def _send_nowait(self, method: str, **params: Any) -> None:
+        """Fire-and-forget CDP send for commands whose response we never
+        consume (currently just Page.screencastFrameAck, sent once per
+        frame). Unlike ``_send`` this allocates no Future and registers
+        no pending entry — it just awaits the websocket write. The
+        command still carries an ``id`` so Chrome's reply is well-formed;
+        ``_recv_loop`` finds no pending Future for it and drops it.
+
+        Awaited from inside the per-event dispatch task that's already
+        running, so it adds no *second* task per frame the way the old
+        ``create_task(self._send("...Ack"))`` did.
+        """
+        self._cmd_id += 1
+        payload: dict[str, Any] = {"id": self._cmd_id, "method": method, "params": params}
+        if self._session_id is not None:
+            payload["sessionId"] = self._session_id
+        msg = json.dumps(payload)
+        assert self._ws
+        await self._ws.send(msg)
+
     async def _recv_loop(self) -> None:
         assert self._ws
         async for raw in self._ws:
@@ -326,12 +377,39 @@ class BrowserBridge:
                     else:
                         fut.set_result(msg.get("result", {}))
             elif "method" in msg:
-                asyncio.create_task(self._dispatch_event(msg["method"], msg.get("params", {})))
+                method = msg["method"]
+                params = msg.get("params", {})
+                if method == "Page.screencastFrame":
+                    # Decode is CPU work handed to an executor and must
+                    # not block draining the socket, so this one event
+                    # gets its own task. Track it so teardown can await
+                    # in-flight frames instead of orphaning them.
+                    self._fire_and_forget(self._on_screencast_frame(params))
+                else:
+                    # Navigate/load/console/error hooks are cheap and
+                    # already-async; await them inline rather than
+                    # spawning a task each. Keeps the socket draining
+                    # (these don't do heavy work) at one fewer task per
+                    # event than the old create_task-everything path.
+                    await self._dispatch_event(method, params)
+
+    def _fire_and_forget(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Schedule *coro* as a tracked background task.
+
+        Tasks are held in ``self._bg_tasks`` until done so they aren't
+        garbage-collected mid-flight (a documented asyncio footgun), and
+        so ``stop()`` can drain in-flight screencast decodes rather than
+        cancelling them out from under the FrameBuffer writer.
+        """
+        task = asyncio.ensure_future(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     async def _dispatch_event(self, method: str, params: dict[str, Any]) -> None:
-        if method == "Page.screencastFrame":
-            await self._on_screencast_frame(params)
-        elif method == "Page.navigatedWithinDocument" or method == "Page.frameNavigated":
+        # Page.screencastFrame is handled directly in _recv_loop (it needs
+        # its own task for the off-loop decode); everything here is a
+        # cheap hook fire awaited inline by the recv loop.
+        if method == "Page.navigatedWithinDocument" or method == "Page.frameNavigated":
             await self._hooks.fire("navigate", url=params.get("url", ""))
         elif method == "Page.loadEventFired":
             await self._hooks.fire("load")
@@ -343,12 +421,14 @@ class BrowserBridge:
             await self._hooks.fire("error", description=desc)
 
     async def _on_screencast_frame(self, params: dict[str, Any]) -> None:
-        # Ack immediately so Chrome keeps pushing
+        # Ack immediately so Chrome keeps pushing. Fire-and-forget send
+        # (no Future, no pending-dict entry) awaited inline within this
+        # already-running task — one fewer task per frame than the old
+        # create_task(self._send("...Ack")).
         session_id = params.get("sessionId", 0)
-        asyncio.create_task(self._send("Page.screencastFrameAck", sessionId=session_id))
+        await self._send_nowait("Page.screencastFrameAck", sessionId=session_id)
 
         data = params.get("data", "")
-        # print(f"[frame] {time.monotonic():.2f}", file=sys.stderr)
         ts = params.get("metadata", {}).get("timestamp", time.monotonic())
 
         loop = asyncio.get_running_loop()
@@ -498,27 +578,14 @@ class BrowserBridge:
         Click an element identified by *selector* and/or *text*, instead
         of a hardcoded pixel position.
 
-        Resolution order
-        -----------------
-        1. If *selector* is given, ``document.querySelectorAll(selector)``
-           is evaluated. If it yields at least one match, *nth* of those
-           matches is used directly (selector matches are NOT redirected
-           to a clickable ancestor — if you wrote the selector, you meant
-           that element).
-        2. Otherwise — or if *selector* matched nothing — *text* is used
-           as a case-insensitive substring match against every element's
-           *own* text content (direct text-node children only, not
-           descendants' concatenated text). Each match is then resolved
-           to its nearest clickable ancestor (``a``, ``button``, ``input``,
-           ``select``, ``textarea``, ``[role="button"]``, ``[onclick]``,
-           ``summary``, ``label``, or the matched element itself if it's
-           already one of those) and the result list is de-duplicated.
-           This matters in practice: matching text like "Login" inside
-           ``<button><b>Login</b></button>`` should click the button, not
-           the inert ``<b>`` wrapping it — verified against jsdom, see
-           module docstring.
-        3. If neither resolves to an element within *timeout* seconds,
-           returns False without raising.
+        Resolution order, parameters, and return semantics for *finding*
+        the element are identical to :meth:`get_bounds` — both methods
+        share one implementation (``_build_finder_js``), so "what would
+        click_element click?" and "what does get_bounds report?" never
+        disagree. See :meth:`get_bounds` for the full resolution-order
+        docs (selector first, text-substring-with-nearest-clickable-
+        ancestor fallback second). This docstring only covers what's
+        click-specific.
 
         Coordinates
         -----------
@@ -564,30 +631,220 @@ class BrowserBridge:
         if selector is None and text is None:
             raise ValueError("click_element requires at least one of selector or text")
 
-        finder_js = _build_finder_js(selector, text, nth)
-
-        elapsed = 0.0
-        while True:
-            box = await self.eval(finder_js)
-            if box is not None:
-                break
-            if elapsed >= timeout:
-                return False
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-        if scroll_into_view:
-            scroll_js = _build_finder_js(selector, text, nth, scroll_into_view=True)
-            box = await self.eval(scroll_js)
-            if box is None:
-                # Element disappeared between the find and the scroll —
-                # treat as not found rather than clicking stale coords.
-                return False
+        box = await self.get_bounds(
+            selector,
+            text=text,
+            nth=nth,
+            scroll_into_view=scroll_into_view,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+        if box is None:
+            return False
 
         cx = box["x"] + box["width"] / 2
         cy = box["y"] + box["height"] / 2
         await self.click(cx, cy, button=button)
         return True
+
+    # ------------------------------------------------------------------
+    # Element bounds (no click)
+    # ------------------------------------------------------------------
+    #
+    # get_bounds() is one real implementation with two @overload stubs
+    # layered on top, so a type checker can narrow the return type from
+    # *which literal value of nth was passed* instead of seeing one big
+    # `dict | list[dict] | None` union on every call site. Without this,
+    # `box = await br.get_bounds(sel)` followed by `box["x"]` makes a
+    # type checker consider the `list[dict]` branch of the union too —
+    # `list.__getitem__` only accepts int/slice, so `box["x"]` looks like
+    # an error there even though, at the default `nth=0`, the *runtime*
+    # return is always a single dict (or None). The two stubs below tell
+    # the checker that an int (or the implicit default) `nth` means "you
+    # get a dict or None back" and `nth=None` means "you get a list
+    # back" — matching the actual runtime contract documented on the
+    # implementation itself.
+    #
+    # These overloads are type-checking-only — they're never called at
+    # runtime (the `...` bodies are never executed); only the final,
+    # non-decorated `get_bounds` below has a real body.
+
+    @overload
+    async def get_bounds(
+        self,
+        selector: Optional[str] = None,
+        *,
+        text: Optional[str] = None,
+        nth: int = 0,
+        detail: bool = False,
+        scroll_into_view: bool = False,
+        timeout: float = 5.0,
+        poll_interval: float = 0.15,
+    ) -> Optional[dict[str, Any]]: ...
+
+    @overload
+    async def get_bounds(
+        self,
+        selector: Optional[str] = None,
+        *,
+        text: Optional[str] = None,
+        nth: None,
+        detail: bool = False,
+        scroll_into_view: bool = False,
+        timeout: float = 5.0,
+        poll_interval: float = 0.15,
+    ) -> list[dict[str, Any]]: ...
+
+    async def get_bounds(
+        self,
+        selector: Optional[str] = None,
+        *,
+        text: Optional[str] = None,
+        nth: Optional[int] = 0,
+        detail: bool = False,
+        scroll_into_view: bool = False,
+        timeout: float = 5.0,
+        poll_interval: float = 0.15,
+    ) -> Union[dict[str, Any], list[dict[str, Any]], None]:
+        """
+        Resolve element(s) by *selector* and/or *text* and return their
+        bounding box(es), without clicking anything.
+
+        Resolution order
+        -----------------
+        1. If *selector* is given, ``document.querySelectorAll(selector)``
+           is evaluated. If it yields at least one match, those matches
+           are used directly (selector matches are NOT redirected to a
+           clickable ancestor — if you wrote the selector, you meant
+           that element).
+        2. Otherwise — or if *selector* matched nothing — *text* is used
+           as a case-insensitive substring match against every element's
+           *own* text content (direct text-node children only, not
+           descendants' concatenated text). Each match is then resolved
+           to its nearest clickable ancestor (``a``, ``button``,
+           ``input``, ``select``, ``textarea``, ``[role="button"]``,
+           ``[onclick]``, ``summary``, ``label``, or the matched element
+           itself if it's already one of those) and the result list is
+           de-duplicated. This is the exact same resolution
+           ``click_element`` uses (both methods share one
+           implementation, ``_build_finder_js``), so "what would
+           click_element click?" and "what does get_bounds report?"
+           never disagree.
+        3. Elements with a zero-area box (detached/hidden) are excluded
+           from the result entirely — they never appear in the list and
+           never count toward *nth*.
+
+        This call polls (same as ``wait_for_selector``/``click_element``)
+        until at least one element resolves or *timeout* elapses; it does
+        not fail just because the page hasn't finished rendering yet.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector, tried first.
+        text:
+            Substring to match against element text content; fallback if
+            *selector* is None or matches nothing.
+        nth:
+            - ``int`` (default ``0``): return a single box — the box at
+              that index in the match list, or ``None`` if there are
+              fewer than ``nth + 1`` matches (or zero matches at all).
+            - ``None``: return *every* matching box as a list (``[]`` if
+              nothing matched). Useful when you don't know in advance
+              how many elements a selector/text will match — e.g.
+              collecting every row in a table or every link in a nav.
+        detail:
+            If True, each returned dict also includes ``tag`` (lowercased
+            tag name) and ``text`` (a trimmed, truncated-to-200-chars
+            snippet of the element's own visible text), in addition to
+            ``x``/``y``/``width``/``height``. Default False — the plain
+            geometry dict, which is all ``click_element`` itself needs
+            internally.
+        scroll_into_view:
+            If True, scrolls the *nth* match into view and re-measures
+            every box against the post-scroll layout before returning.
+            Only meaningful when *nth* is an int — scrolling "the nth
+            element" has no defined meaning when you've asked for the
+            whole list. Combining ``scroll_into_view=True`` with
+            ``nth=None`` raises ``ValueError`` rather than silently
+            ignoring the flag, since silently dropping a parameter the
+            caller explicitly set is exactly the kind of thing that
+            bites someone later in a debugging session.
+        timeout, poll_interval:
+            Same semantics as ``wait_for_selector``/``click_element`` —
+            poll until at least one element appears or *timeout*
+            elapses.
+
+        Returns
+        -------
+        dict | None
+            When *nth* is an int: ``{"x", "y", "width", "height"}``
+            (plus ``"tag"``/``"text"`` if *detail* is True), or ``None``
+            if no element at that index was found within *timeout*.
+        list[dict]
+            When *nth* is ``None``: every matching box, in the order
+            described above. Empty list if nothing matched within
+            *timeout* — note this is a plain empty list, not ``None``,
+            since "the list of matches" and "no list at all" are
+            different things when *nth* itself wasn't asking for one
+            specific element.
+
+        Raises
+        ------
+        ValueError
+            If neither *selector* nor *text* is given, or if
+            ``scroll_into_view=True`` is combined with ``nth=None``.
+
+        Examples
+        --------
+        Single element, the common case (mirrors what ``click_element``
+        would click)::
+
+            box = await br.get_bounds("#submit-button")
+            if box is not None:
+                print(box["x"], box["y"])
+
+        Every row in a table, to drive your own iteration::
+
+            rows = await br.get_bounds("table.results tr")
+            for row in rows:
+                cx = row["x"] + row["width"] / 2
+                cy = row["y"] + row["height"] / 2
+                await br.click(cx, cy)
+
+        With detail, to disambiguate which text match you got::
+
+            box = await br.get_bounds(text="Submit", detail=True)
+            print(box["tag"], box["text"])
+        """
+        if selector is None and text is None:
+            raise ValueError("get_bounds requires at least one of selector or text")
+        if scroll_into_view and nth is None:
+            raise ValueError(
+                "scroll_into_view=True has no defined meaning with nth=None "
+                "(there is no single element to scroll to) — pass an int nth, "
+                "or drop scroll_into_view."
+            )
+
+        scroll_idx = nth if scroll_into_view else None
+        finder_js = _build_finder_js(selector, text, scroll_into_view_nth=scroll_idx, detail=detail)
+
+        elapsed = 0.0
+        while True:
+            boxes = await self.eval(finder_js, await_promise=False)
+            if boxes:  # non-empty list — at least one element resolved
+                break
+            if elapsed >= timeout:
+                boxes = []
+                break
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        if nth is None:
+            return boxes
+        if 0 <= nth < len(boxes):
+            return boxes[nth]
+        return None
 
     async def move(self, x: float, y: float) -> None:
         self._require_input()
@@ -671,26 +928,24 @@ class BrowserBridge:
 
 
 def _jpeg_to_rgba(data_b64: str, width: int, height: int) -> np.ndarray:
-    """Decode a base64 JPEG payload to an H×W×4 RGBA uint8 array."""
+    """Decode a base64 JPEG payload to an H×W×4 RGBA uint8 array.
+
+    With PyTurboJPEG present, libjpeg-turbo writes RGBA directly in a
+    single decode pass (alpha guaranteed 0xFF), so there is no BGR
+    intermediate array and no per-channel Python-driven copy. Only the
+    rare size-mismatch path allocates a second array (to LANCZOS-resize).
+    """
     raw = base64.b64decode(data_b64)
     if _turbo is not None:
-        bgr = _turbo.decode(raw)
-        if bgr.shape[:2] == (height, width):
-            rgba = np.empty((bgr.shape[0], bgr.shape[1], 4), dtype=np.uint8)
-            rgba[..., 0] = bgr[..., 2]
-            rgba[..., 1] = bgr[..., 1]
-            rgba[..., 2] = bgr[..., 0]
-            rgba[..., 3] = 255
+        rgba = _turbo.decode(raw, pixel_format=TJPF_RGBA)
+        if rgba.shape[:2] == (height, width):
             return rgba
-        # size mismatch: resize the *decoded* BGR array, don't re-decode with Pillow
-
-        bgr = np.asarray(
-            Image.fromarray(bgr[..., ::-1]).resize((width, height), Image.Resampling.LANCZOS)
+        # size mismatch: resize the already-decoded RGBA array rather
+        # than re-decoding. Pillow handles RGBA directly.
+        return np.asarray(
+            Image.fromarray(rgba, mode="RGBA").resize((width, height), Image.Resampling.LANCZOS),
+            dtype=np.uint8,
         )
-        rgba = np.empty((height, width, 4), dtype=np.uint8)
-        rgba[..., :3] = bgr
-        rgba[..., 3] = 255
-        return rgba
     img = Image.open(io.BytesIO(raw)).convert("RGBA")
     if img.size != (width, height):
         img = img.resize((width, height), Image.LANCZOS)  # type: ignore[attr-defined]
@@ -705,34 +960,81 @@ _CLICKABLE_SEL = 'a,button,input,select,textarea,[role="button"],[onclick],summa
 def _build_finder_js(
     selector: Optional[str],
     text: Optional[str],
-    nth: int,
     *,
-    scroll_into_view: bool = False,
+    scroll_into_view_nth: Optional[int] = None,
+    detail: bool = False,
 ) -> str:
     """
-    Build a JS expression for Runtime.evaluate that resolves an element by
-    selector (preferred) or text substring (fallback) and returns its
-    bounding box as ``{x, y, width, height}`` (viewport-relative — the
-    coordinate space `Input.dispatchMouseEvent` expects), or ``null`` if
-    nothing resolves.
+    Build a JS expression for Runtime.evaluate that resolves elements by
+    selector (preferred) or text substring (fallback) and returns a JSON
+    array of every match's bounding box, in document order after the
+    selector/text/nearest-clickable-ancestor resolution described below.
+    Returns ``[]`` (not ``null``) if nothing resolves — callers handle
+    the "empty vs missing index" distinction on the Python side
+    (``get_bounds``/``click_element``), since whether an empty list means
+    "still loading, keep polling" or "definitely absent" depends on
+    elapsed time the JS itself has no visibility into.
+
+    This single function is shared by both ``click_element`` and
+    ``get_bounds`` — there is exactly one implementation of the
+    selector/text resolution logic, not one per caller, which is what
+    guarantees they never disagree about which element a given
+    selector/text resolves to.
+
+    Resolution order
+    -----------------
+    1. If *selector* is given, ``document.querySelectorAll(selector)`` is
+       evaluated. If it yields at least one match, those matches are used
+       directly (selector matches are NOT redirected to a clickable
+       ancestor — if you wrote the selector, you meant that element).
+    2. Otherwise — or if *selector* matched nothing — *text* is used as a
+       case-insensitive substring match against every element's *own*
+       text content (direct text-node children only, not descendants'
+       concatenated text). Each match is then resolved to its nearest
+       clickable ancestor (``a``, ``button``, ``input``, ``select``,
+       ``textarea``, ``[role="button"]``, ``[onclick]``, ``summary``,
+       ``label``, or the matched element itself if it's already one of
+       those) and the result list is de-duplicated. This matters in
+       practice: matching text like "Login" inside
+       ``<button><b>Login</b></button>`` should resolve to the button,
+       not the inert ``<b>`` wrapping it — verified against jsdom.
+
+    Each returned box is ``{x, y, width, height}`` (viewport-relative —
+    the coordinate space ``Input.dispatchMouseEvent`` expects), or, if
+    *detail* is True, additionally ``{tag, text}`` where ``tag`` is the
+    lowercased tag name and ``text`` is a trimmed, whitespace-collapsed,
+    200-char-truncated snippet of the element's own text content (same
+    "direct text-node children only" rule as the text-match step above).
+    Elements with a zero-area box (detached or ``display: none``) are
+    excluded from the output entirely — they never occupy a slot in the
+    returned array, so they never shift or get assigned an *nth* index.
+
+    *scroll_into_view_nth*, if given, calls ``element.scrollIntoView()``
+    on exactly that index of the (deduplicated) match list before any
+    boxes are measured, so every returned box — not just that one
+    element's — reflects the post-scroll layout. Mirrors the original
+    click_element behavior of re-reading the bounding box after a
+    scroll, generalized to the fact that this function now always
+    returns the full list rather than one pre-selected box.
 
     *selector* and *text* are JSON-encoded into the expression so
     arbitrary strings (quotes, backslashes, unicode) embed safely —
-    `json.dumps` rather than Python `repr`, since this is JS, not Python
-    (the existing `wait_for_selector` uses `repr` because it calls
-    `querySelector` directly with a Python-side f-string; this builds a
-    bigger expression so a JSON literal is cleaner).
+    ``json.dumps`` rather than Python ``repr``, since this is JS, not
+    Python (the existing ``wait_for_selector`` uses ``repr`` because it
+    calls ``querySelector`` directly with a Python-side f-string; this
+    builds a bigger expression so a JSON literal is cleaner).
     """
     sel_json = json.dumps(selector) if selector is not None else "null"
     text_json = json.dumps(text) if text is not None else "null"
-    scroll_json = "true" if scroll_into_view else "false"
+    detail_json = "true" if detail else "false"
+    scroll_idx_json = str(int(scroll_into_view_nth)) if scroll_into_view_nth is not None else "null"
 
     return f"""
 (() => {{
     const sel = {sel_json};
     const textNeedle = {text_json};
-    const nth = {nth};
-    const doScroll = {scroll_json};
+    const wantDetail = {detail_json};
+    const scrollIdx = {scroll_idx_json};
     const CLICKABLE_SEL = {json.dumps(_CLICKABLE_SEL)};
 
     function nearestClickable(el) {{
@@ -758,15 +1060,26 @@ def _build_finder_js(
         matches = Array.from(new Set(matches));
     }}
 
-    const el = matches[nth];
-    if (!el) return null;
-
-    if (doScroll) {{
-        el.scrollIntoView({{ block: 'center', inline: 'center' }});
+    if (scrollIdx !== null && matches[scrollIdx]) {{
+        matches[scrollIdx].scrollIntoView({{ block: 'center', inline: 'center' }});
     }}
 
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) return null;  // detached/hidden
-    return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
+    const out = [];
+    for (const el of matches) {{
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;  // detached/hidden
+        const box = {{ x: r.x, y: r.y, width: r.width, height: r.height }};
+        if (wantDetail) {{
+            box.tag = el.tagName ? el.tagName.toLowerCase() : '';
+            let own = '';
+            for (const node of el.childNodes) {{
+                if (node.nodeType === Node.TEXT_NODE) own += node.textContent;
+            }}
+            own = own.trim().replace(/\\s+/g, ' ');
+            box.text = own.length > 200 ? own.slice(0, 200) : own;
+        }}
+        out.push(box);
+    }}
+    return out;
 }})()
 """

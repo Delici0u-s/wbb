@@ -271,8 +271,27 @@ class SDLWindow:
         ``_FrameTexturePaintable.set_texture`` resize handling — same
         "filters can change output size between frames" contract from
         ``DisplayClient``'s docstring).
+
+        Upload path
+        -----------
+        Uses ``SDL_LockTexture`` to obtain a pointer into the texture's
+        own staging memory and writes the frame rows directly into it,
+        rather than ``SDL_UpdateTexture`` (which copies from a source
+        buffer the driver doesn't own). This removes one CPU-side copy
+        per frame on the streaming-texture path LockTexture exists for.
+
+        Contiguity
+        ----------
+        Only calls ``ascontiguousarray`` when the incoming array is
+        *not* already C-contiguous. The common cases — a frame straight
+        out of shared memory, or the output of a LUT color filter — are
+        already contiguous, so the guard is a no-op flag check rather
+        than a silent 3.6 MB re-materialisation every frame. Zero-copy
+        filters that return a non-contiguous view (``crop``/``flip``)
+        still get the one copy they genuinely need.
         """
-        arr = np.ascontiguousarray(arr, dtype=np.uint8)
+        if arr.dtype != np.uint8 or not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr, dtype=np.uint8)
         h, w = arr.shape[0], arr.shape[1]
 
         if (w, h) != self._tex_size:
@@ -292,9 +311,36 @@ class SDLWindow:
             self._tex_size = (w, h)
             sdl2.SDL_SetWindowSize(self.window, w, h)
 
-        pitch = w * 4
-        ptr = arr.ctypes.data_as(ctypes.c_void_p)
-        sdl2.SDL_UpdateTexture(self._texture, None, ptr, pitch)
+        src_pitch = w * 4
+
+        pixels_ptr = ctypes.c_void_p()
+        pitch = ctypes.c_int()
+        locked = sdl2.SDL_LockTexture(
+            self._texture, None, ctypes.byref(pixels_ptr), ctypes.byref(pitch)
+        )
+        if locked != 0:
+            # Lock failed (driver quirk) — fall back to UpdateTexture
+            # rather than dropping the frame.
+            ptr = arr.ctypes.data_as(ctypes.c_void_p)
+            sdl2.SDL_UpdateTexture(self._texture, None, ptr, src_pitch)
+        else:
+            dst_pitch = pitch.value
+            src_addr = arr.ctypes.data
+            if dst_pitch == src_pitch:
+                # Tightly packed: one contiguous copy of the whole frame.
+                ctypes.memmove(pixels_ptr, ctypes.c_void_p(src_addr), src_pitch * h)
+            else:
+                # Padded destination rows: copy row by row honouring the
+                # texture's own pitch.
+                dst_base = pixels_ptr.value
+                for y in range(h):
+                    ctypes.memmove(
+                        ctypes.c_void_p(dst_base + y * dst_pitch),
+                        ctypes.c_void_p(src_addr + y * src_pitch),
+                        src_pitch,
+                    )
+            sdl2.SDL_UnlockTexture(self._texture)
+
         sdl2.SDL_RenderClear(self.renderer)
         sdl2.SDL_RenderCopy(self.renderer, self._texture, None, None)
         sdl2.SDL_RenderPresent(self.renderer)

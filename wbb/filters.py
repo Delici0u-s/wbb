@@ -34,6 +34,79 @@ Filter = Callable[[np.ndarray], np.ndarray]
 
 
 # ---------------------------------------------------------------------------
+# LUT-fused per-channel color filters
+# ---------------------------------------------------------------------------
+#
+# colorize / brightness / contrast (and the RGB-scaling part of any
+# per-channel point operation) are all functions applied independently
+# to each pixel value in each channel. That makes them expressible as a
+# 256-entry uint8 lookup table per channel — a (256, 4) array — applied
+# in one pass with ``lut[frame]`` fancy indexing.
+#
+# Two wins over the old astype(float32) -> math -> clip -> astype(uint8)
+# form:
+#   1. One uint8 gather instead of several full-frame float32 temporaries
+#      (a 1280x720x4 float32 temp is 14.7 MB; the old colorize+contrast
+#      chain allocated a handful of them per frame). The LUT itself is
+#      4 KB, built once at filter-construction time, not per frame.
+#   2. Composable for free: applying LUT B after LUT A is just
+#      ``B_table[A_table]`` — gather the two tables into one at
+#      chain-build time, so an N-deep color chain costs exactly one
+#      gather per frame regardless of N.
+#
+# A LUT filter is marked with ._wbb_lut (the (256,4) table) so chain()
+# and compose() can detect adjacent LUT filters and fuse their tables.
+
+
+class _LutFilter:
+    """A per-channel point filter backed by a (256, 4) uint8 table.
+
+    Calling it applies ``table[frame]``. Two ``_LutFilter``s compose by
+    composing their tables, so a chain of them collapses to a single
+    gather per frame.
+    """
+
+    __slots__ = ("_table",)
+
+    def __init__(self, table: np.ndarray) -> None:
+        # table: (256, 4) uint8 — table[v, c] is the output for input
+        # value v in channel c.
+        self._table = table
+
+    def __call__(self, frame: np.ndarray) -> np.ndarray:
+        # frame is H x W x 4 uint8. Index each channel's column of the
+        # table by that channel's values. take_along_axis keeps it one
+        # vectorised gather with no Python-level channel loop.
+        # self._table[frame] would broadcast the whole (256,4) table per
+        # element; instead gather per-channel:
+        f = frame
+        out = np.empty_like(f)
+        t = self._table
+        out[..., 0] = t[f[..., 0], 0]
+        out[..., 1] = t[f[..., 1], 1]
+        out[..., 2] = t[f[..., 2], 2]
+        out[..., 3] = t[f[..., 3], 3]
+        return out
+
+    def then(self, other: "_LutFilter") -> "_LutFilter":
+        """Return a single LUT equivalent to applying self then other."""
+        # other applied after self: for each channel, compose the maps.
+        # other._table[self._table] gathers self's outputs through
+        # other's table, per channel.
+        s = self._table
+        o = other._table
+        fused = np.empty((256, 4), dtype=np.uint8)
+        for c in range(4):
+            fused[:, c] = o[s[:, c], c]
+        return _LutFilter(fused)
+
+
+def _identity_table() -> np.ndarray:
+    base = np.arange(256, dtype=np.uint8)
+    return np.repeat(base[:, None], 4, axis=1)  # (256, 4)
+
+
+# ---------------------------------------------------------------------------
 # Spatial transforms
 # ---------------------------------------------------------------------------
 
@@ -86,6 +159,9 @@ def grayscale() -> Filter:
     """
     Convert RGB channels to luminance (ITU-R BT.601) while preserving
     the alpha channel.
+
+    Not a per-channel LUT (it mixes channels), so it stays a real
+    per-frame compute and does not fuse with the LUT filters around it.
     """
     _coeffs = np.array([0.299, 0.587, 0.114, 0.0], dtype=np.float32)
 
@@ -104,48 +180,52 @@ def colorize(r: float = 1.0, g: float = 1.0, b: float = 1.0, a: float = 1.0) -> 
     """
     Multiply each channel by the given factor (clipped to [0, 255]).
 
+    Implemented as a per-channel LUT, so it composes with brightness/
+    contrast into a single lookup (see module-level ``_LutFilter``).
+
     Example — a warm red tint::
 
         filters.colorize(r=1.3, g=0.8, b=0.7)
     """
-    _muls = np.array([r, g, b, a], dtype=np.float32)
-
-    def _colorize(frame: np.ndarray) -> np.ndarray:
-        return (frame.astype(np.float32) * _muls).clip(0, 255).astype(np.uint8)
-
-    return _colorize
+    vals = np.arange(256, dtype=np.float32)
+    table = np.empty((256, 4), dtype=np.uint8)
+    for c, m in enumerate((r, g, b, a)):
+        table[:, c] = (vals * m).clip(0, 255).astype(np.uint8)
+    return _LutFilter(table)
 
 
 def brightness(delta: int) -> Filter:
     """
     Shift pixel values by *delta* (positive = brighter, negative = darker).
 
-    Alpha is unchanged. *delta* is clipped to keep values in [0, 255].
+    Alpha is unchanged. Implemented as a per-channel LUT, fusable with
+    colorize/contrast.
     """
-
-    def _bright(frame: np.ndarray) -> np.ndarray:
-        out = np.asarray(frame.copy())
-        rgb = out[..., :3].astype(np.int16)
-        out[..., :3] = (rgb + delta).clip(0, 255).astype(np.uint8)
-        return out
-
-    return _bright
+    vals = np.arange(256, dtype=np.int16)
+    table = np.empty((256, 4), dtype=np.uint8)
+    shifted = (vals + delta).clip(0, 255).astype(np.uint8)
+    table[:, 0] = shifted
+    table[:, 1] = shifted
+    table[:, 2] = shifted
+    table[:, 3] = np.arange(256, dtype=np.uint8)  # alpha untouched
+    return _LutFilter(table)
 
 
 def contrast(factor: float) -> Filter:
     """
     Scale contrast around the midpoint (128) by *factor*.
 
-    Values < 1 reduce contrast; values > 1 increase it.
+    Values < 1 reduce contrast; values > 1 increase it. Per-channel LUT,
+    fusable with colorize/brightness.
     """
-
-    def _contrast(frame: np.ndarray) -> np.ndarray:
-        out = np.asarray(frame.copy())
-        rgb = out[..., :3].astype(np.float32)
-        out[..., :3] = ((rgb - 128) * factor + 128).clip(0, 255).astype(np.uint8)
-        return out
-
-    return _contrast
+    vals = np.arange(256, dtype=np.float32)
+    scaled = ((vals - 128) * factor + 128).clip(0, 255).astype(np.uint8)
+    table = np.empty((256, 4), dtype=np.uint8)
+    table[:, 0] = scaled
+    table[:, 1] = scaled
+    table[:, 2] = scaled
+    table[:, 3] = np.arange(256, dtype=np.uint8)  # alpha untouched
+    return _LutFilter(table)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +265,14 @@ def blur(radius: int = 2) -> Filter:
 
 
 def compose(first: Filter, second: Filter) -> Filter:
-    """Return a filter that applies *first* then *second*."""
+    """Return a filter that applies *first* then *second*.
+
+    If both are per-channel LUT filters (colorize/brightness/contrast),
+    they are fused into a single LUT at build time, so the composed
+    filter costs one gather per frame instead of two.
+    """
+    if isinstance(first, _LutFilter) and isinstance(second, _LutFilter):
+        return first.then(second)
 
     def _composed(frame: np.ndarray) -> np.ndarray:
         return second(first(frame))
@@ -198,12 +285,26 @@ def chain(*filters: Filter) -> Filter:
     Compose an ordered sequence of filters into a single filter.
 
     ``chain(f, g, h)(x)`` is equivalent to ``h(g(f(x)))``.
+
+    Runs of adjacent per-channel LUT filters (colorize/brightness/
+    contrast) are fused into a single LUT, so e.g.
+    ``chain(colorize(...), contrast(...), brightness(...))`` collapses to
+    one gather per frame. A non-LUT filter (crop/scale/blur/grayscale/
+    flip/custom) breaks the run; LUT fusion resumes after it.
     """
     if not filters:
         return lambda f: f
 
-    result = filters[0]
-    for f in filters[1:]:
+    # Coalesce maximal runs of _LutFilter into single fused LUTs first.
+    coalesced: list[Filter] = []
+    for f in filters:
+        if isinstance(f, _LutFilter) and coalesced and isinstance(coalesced[-1], _LutFilter):
+            coalesced[-1] = coalesced[-1].then(f)
+        else:
+            coalesced.append(f)
+
+    result = coalesced[0]
+    for f in coalesced[1:]:
         result = compose(result, f)
     return result
 

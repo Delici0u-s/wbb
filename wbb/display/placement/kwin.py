@@ -103,8 +103,41 @@ true; // loadScript() wants a truthy final expression
 _SET_ABOVE_BODY = "w.keepAbove = %(above)s;"
 
 _SET_GEOMETRY_BODY = (
-    'var rect = { x: %(x)d, y: %(y)d, width: %(width)d, height: %(height)d }; '
-    'if ("frameGeometry" in w) { w.frameGeometry = rect; } else { w.geometry = rect; }'
+    "var gx = %(x)d, gy = %(y)d, gw = %(width)d, gh = %(height)d;\n"
+    "    // 1) Move the window onto whichever output actually contains the\n"
+    "    //    target top-left, BEFORE setting geometry. KWin constrains a\n"
+    "    //    frameGeometry assignment to the window's *current* output's\n"
+    "    //    area, so if we don't move outputs first, a target on another\n"
+    "    //    monitor (or in that monitor's offset region) gets clamped\n"
+    "    //    back. workspace.screens carries each output's global-coord\n"
+    "    //    geometry; pick the one whose rect contains (gx, gy).\n"
+    "    try {\n"
+    "        var screens = workspace.screens || [];\n"
+    "        for (var s = 0; s < screens.length; s++) {\n"
+    "            var sg = screens[s].geometry;\n"
+    "            if (gx >= sg.x && gx < sg.x + sg.width &&\n"
+    "                gy >= sg.y && gy < sg.y + sg.height) {\n"
+    "                if (w.output !== screens[s]) { w.output = screens[s]; }\n"
+    "                break;\n"
+    "            }\n"
+    "        }\n"
+    "    } catch (e) { /* older KWin without workspace.screens/output: skip */ }\n"
+    "\n"
+    "    // 2) Set position by MUTATING frameGeometry's sub-properties\n"
+    "    //    rather than assigning a whole new rect object. On Plasma 6's\n"
+    "    //    QJSEngine the whole-object assignment (w.frameGeometry = {..})\n"
+    "    //    is unreliable/ignored for the position component; mutating\n"
+    "    //    .x/.y/.width/.height in place is the form that actually\n"
+    "    //    takes (see KDE Discuss reports on frameGeometry read-only\n"
+    "    //    behavior). Fall back to geometry / whole-object only if\n"
+    "    //    frameGeometry isn't present.\n"
+    "    if (\"frameGeometry\" in w) {\n"
+    "        var fg = w.frameGeometry;\n"
+    "        fg.width = gw; fg.height = gh; fg.x = gx; fg.y = gy;\n"
+    "        w.frameGeometry = fg;  // write-back too, covers both engines\n"
+    "    } else {\n"
+    "        w.geometry = { x: gx, y: gy, width: gw, height: gh };\n"
+    "    }"
 )
 
 

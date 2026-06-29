@@ -109,6 +109,12 @@ ScrollCallback = Callable[[float, float], Any]
 _PLACEMENT_RETRY_FRAMES = 5
 
 
+# Sentinel for set_position(monitor=...): distinguishes "argument omitted,
+# keep the current mode" from an explicit monitor=None (which now means
+# global virtual-desktop coordinates, a real value).
+_KEEP: object = object()
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class WindowPosition:
     x: int
@@ -143,17 +149,33 @@ class DisplayClient:
         Pin the window to a fixed size. If omitted, auto-sizes to the
         buffer's native dimensions.
     position:
-        Initial (x, y) pixel position, **local to the monitor selected
-        by `monitor=`** — not local to (0, 0) of the whole virtual
-        desktop. See ``monitor=`` below; this is the fix for the
-        multi-monitor bug.
+        Initial (x, y) pixel position. Its coordinate space is set by
+        ``monitor=`` below. With the default (``monitor=None``) it is a
+        **global virtual-desktop** pixel — placeable anywhere across all
+        monitors, including a monitor whose global origin is offset
+        (negative ``x`` to the left of primary, positive ``y`` for a
+        taller monitor sitting below a shorter one mounted higher). This
+        is what lets you drop the window at an arbitrary desktop
+        position.
     monitor:
-        Which monitor ``position`` is local to, as an index into
-        ``wbb_display.list_displays()`` (0 = whatever SDL enumerates
-        first — not guaranteed to match physical left-to-right order;
-        call ``list_displays()`` yourself and check each entry's
-        ``.x``/``.y``/``.width``/``.height`` if you need to know which
-        index is which monitor on your setup). Defaults to 0.
+        Selects how ``position`` is interpreted.
+
+        * ``None`` (default) — ``position`` is in global virtual-desktop
+          coordinates. Use this to place the window anywhere on the
+          unified desktop. ``list_displays()`` reports each monitor's
+          global origin/size if you want to compute a target relative to
+          a specific monitor yourself.
+        * ``int`` — ``position`` is local to that monitor, as an index
+          into ``list_displays()`` (0 = whatever SDL enumerates first,
+          not guaranteed left-to-right; check each entry's
+          ``.x``/``.y``/``.width``/``.height``). The monitor's origin is
+          added to ``position`` to get the global coordinate.
+
+        Note: a previous version defaulted this to ``0`` and *always*
+        ran monitor-local, which anchored every position to monitor 0's
+        top-left and made it impossible to reach desktop rows outside
+        that monitor's vertical span — the multi-monitor placement
+        regression. The default is now global to avoid that.
     always_on_top, borderless, click_through:
         Same semantics as the old GTK4 client. ``click_through`` is
         real on X11 sessions (Shape extension), and a clean, explained
@@ -182,14 +204,14 @@ class DisplayClient:
         on_key_event: Optional[KeyCallback] = None,
         on_scroll_event: Optional[ScrollCallback] = None,
         window_size: Optional[tuple[int, int]] = None,
-        position: tuple[int, int] = (0, 0),
-        monitor: int = 0,
+        position: Optional[tuple[int, int]] = None,
+        monitor: Optional[int] = None,
         always_on_top: bool = False,
         borderless: bool = False,
         click_through: bool = False,
         max_fps: float = 60.0,
     ) -> None:
-        if not (
+        if position is not None and not (
             isinstance(position, tuple)
             and len(position) == 2
             and all(isinstance(v, int) for v in position)
@@ -204,8 +226,16 @@ class DisplayClient:
         self._on_key = on_key_event
         self._on_scroll = on_scroll_event
         self._fixed_window_size = window_size
-        self._requested_local_position = position
-        self._monitor_index = monitor
+        # None => no position requested: let the compositor place the
+        # window naturally (do NOT force it to (0,0), which would slam it
+        # into the desktop origin — that origin can even be a different
+        # monitor than you expect on offset multi-monitor layouts).
+        self._position_requested = position is not None
+        self._requested_local_position = position if position is not None else (0, 0)
+        # None => position is global virtual-desktop coordinates (default
+        # when a position IS given); an int => position is local to that
+        # monitor's origin. See _resolve_global_position for the two modes.
+        self._monitor_index: Optional[int] = monitor
         self._always_on_top = always_on_top
         self._borderless = borderless
         self._click_through_requested = click_through
@@ -343,19 +373,41 @@ class DisplayClient:
     # Multi-monitor position resolution
     # ------------------------------------------------------------------
     def _resolve_global_position(
-        self, monitor_index: int, local: tuple[int, int]
+        self, monitor_index: Optional[int], local: tuple[int, int]
     ) -> tuple[int, int]:
         """
-        Translate a monitor-local (x, y) into the single global
-        coordinate space every placement backend actually expects —
-        see _window.py's "Multi-monitor coordinates" docstring section
-        for why that space, not (0, 0)-per-monitor, is the real
-        contract. ``monitor_index`` out of range, or no displays
-        enumerable at all, falls back to treating ``local`` as already
-        global (i.e. adds (0, 0)) — the same behavior the old, buggy
-        code had everywhere, so a misconfigured monitor index degrades
-        to the previous behavior rather than a new failure mode.
+        Translate a requested position into the single global
+        coordinate space every placement backend actually expects (see
+        _window.py's "Multi-monitor coordinates" docstring section).
+
+        Two modes, selected by *monitor_index*:
+
+        * ``None`` — *global mode*. ``local`` is already in global
+          virtual-desktop coordinates; return it unchanged. This is the
+          mode that lets you place the window at an arbitrary desktop
+          pixel, including anywhere on a monitor whose global origin is
+          offset (the common multi-monitor case: a shorter monitor
+          mounted higher means the taller monitor's origin has a
+          positive ``y``, and a monitor to the left has a negative
+          ``x``). Use ``list_displays()`` to read those origins and add
+          them yourself if you want, or just pass the global pixel you
+          actually mean.
+
+        * ``int`` — *monitor-local mode*. ``local`` is local to that
+          monitor; its global origin (from ``list_displays()``) is added.
+          An out-of-range index, or no displays enumerable at all, falls
+          back to treating ``local`` as already global (adds (0, 0)) and
+          warns, so a misconfigured index degrades rather than raises.
+
+        The previous regression was that *every* call went through
+        monitor-local mode anchored to ``monitor=0``, so a position's
+        ``y`` was always measured from monitor 0's top edge — making it
+        impossible to reach desktop rows above (or, depending on layout,
+        below) that monitor. Global mode removes that anchoring.
         """
+        if monitor_index is None:
+            return local
+
         displays = list_displays()
         if not displays or not (0 <= monitor_index < len(displays)):
             if displays:
@@ -385,7 +437,7 @@ class DisplayClient:
             return
         if self._always_on_top:
             self._placement.set_above(True)
-        if self._placement.supports_position():
+        if self._position_requested and self._placement.supports_position():
             gx, gy = self._resolve_global_position(
                 self._monitor_index, self._requested_local_position
             )
@@ -408,41 +460,76 @@ class DisplayClient:
         """
         return self._click_through_active
 
-    def set_position(self, position: tuple[int, int], *, monitor: Optional[int] = None) -> None:
+    def set_position(
+        self,
+        position: "tuple[int, int] | int",
+        position_y: Optional[int] = None,
+        *,
+        monitor: "Optional[int] | object" = _KEEP,
+    ) -> None:
         """
-        Move the window. ``position`` is monitor-local, same
-        convention as the constructor's ``position=`` — pass
-        ``monitor=`` to target a different monitor than the one given
-        at construction time; omit it to keep using the original.
+        Move the window. Accepts either a single ``(x, y)`` tuple or two
+        separate ints::
+
+            display.set_position((100, 200))
+            display.set_position(100, 200)
+
+        Coordinate convention follows ``monitor``:
+
+        * Omit ``monitor`` (the default) — keep whatever mode was set at
+          construction or by a previous call. With the constructor's new
+          default that means *global virtual-desktop coordinates*.
+        * ``monitor=None`` — explicitly use global virtual-desktop
+          coordinates: ``position`` is an absolute desktop pixel,
+          placeable anywhere across all monitors (this is what restores
+          arbitrary placement on offset multi-monitor layouts).
+        * ``monitor=<int>`` — ``position`` is local to that monitor's
+          origin (see ``list_displays()``).
 
         No-op if called before ``run_async()`` has created the window
-        (``self._win``/``self._placement`` are ``None`` until then) —
-        same as before. If you need the window positioned correctly
-        immediately on startup, pass ``position=``/``monitor=`` to the
-        constructor instead; the startup race that used to make a
-        single early ``set_position()`` unreliable is handled
-        internally now (see module docstring point 4), not by calling
-        this method early.
+        (``self._win``/``self._placement`` are ``None`` until then). If
+        you need the window positioned correctly immediately on startup,
+        pass ``position=``/``monitor=`` to the constructor instead; the
+        startup race that used to make a single early ``set_position()``
+        unreliable is handled internally now (see module docstring
+        point 4).
         """
+        if position_y is None:
+            if not isinstance(position, tuple):
+                raise TypeError("expected an (x, y) tuple or two ints")
+            pos = position
+        else:
+            if not isinstance(position, int):
+                raise TypeError("expected two ints when passing x and y separately")
+            pos = (position, position_y)
+
         if self._win is None or self._placement is None:
             return
-        mon = monitor if monitor is not None else self._monitor_index
+
+        # _KEEP sentinel => preserve the current mode; an explicit None
+        # => global mode; an int => monitor-local. None is now a real,
+        # distinct value (global), which is why "keep current" needed its
+        # own sentinel rather than reusing None.
+        mon = self._monitor_index if monitor is _KEEP else monitor  # type: ignore[assignment]
+
         w, h = self._fixed_window_size or (self._buf.width, self._buf.height)
-        self._requested_local_position = position
-        self._monitor_index = mon
-        gx, gy = self._resolve_global_position(mon, position)
+        self._position_requested = True
+        self._requested_local_position = pos
+        self._monitor_index = mon  # type: ignore[assignment]
+        gx, gy = self._resolve_global_position(mon, pos)  # type: ignore[arg-type]
         self._placement.set_position(gx, gy, w, h)
         # Re-arm a few retries: a position change requested well after
-        # startup is not racing the initial map, but it costs nothing
-        # to also cover the (rarer) case of a monitor hot-plug or a
-        # compositor-side reset racing this particular call.
+        # startup is not racing the initial map, but it costs nothing to
+        # also cover a monitor hot-plug or compositor-side reset racing
+        # this particular call.
         self._placement_retries_remaining = max(
             self._placement_retries_remaining, _PLACEMENT_RETRY_FRAMES
         )
 
     def get_position(self) -> WindowPosition:
-        """Returns the last-requested position, monitor-local (same
-        convention as set_position/the constructor) — not the global
+        """Returns the last-requested position in whatever convention was
+        last used (global by default, or local to ``self._monitor_index``
+        if an int monitor was set) — not necessarily the resolved global
         coordinate actually sent to the placement backend."""
         return WindowPosition(
             x=self._requested_local_position[0], y=self._requested_local_position[1]

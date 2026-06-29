@@ -29,6 +29,7 @@ import logging
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from typing import AsyncIterator, Optional
 
@@ -98,6 +99,23 @@ class FrameBuffer:
         self._cv = threading.Condition()
         self._generation = 0  # bumped on every write, never reset
 
+        # Dedicated executor for next_frame()'s blocking Condition wait.
+        # Created lazily on first await (so a pure writer process never
+        # spins one up). The point: a parked reader must NOT consume a
+        # worker from asyncio's shared default executor, because that
+        # same default pool is where BrowserBridge runs JPEG decode. With
+        # the old run_in_executor(None, ...), N blocked readers across N
+        # DisplayClients could pin all cpu+4 default workers and starve
+        # decode. A private pool parks waiters off to the side instead.
+        #
+        # Sized small but > 1 so several coroutines in the *same* process
+        # (e.g. a DisplayClient + a recorder + a monitor all awaiting the
+        # same buffer, as in example 06) can park concurrently without
+        # serialising behind one wait thread. Threads are idle-blocked,
+        # not burning CPU, so this is cheap. Closed in close().
+        self._wait_executor: Optional[ThreadPoolExecutor] = None
+        self._wait_executor_lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # Writer interface (called by BrowserBridge)
     # ------------------------------------------------------------------
@@ -161,6 +179,19 @@ class FrameBuffer:
     # Async interface
     # ------------------------------------------------------------------
 
+    def _ensure_wait_executor(self) -> ThreadPoolExecutor:
+        # Double-checked lazy init; next_frame can be called from
+        # concurrent coroutines.
+        ex = self._wait_executor
+        if ex is not None:
+            return ex
+        with self._wait_executor_lock:
+            if self._wait_executor is None:
+                self._wait_executor = ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix=f"wbb-wait-{self.name}"
+                )
+            return self._wait_executor
+
     async def next_frame(self, timeout: float = 5.0) -> Frame:
         loop = asyncio.get_running_loop()
 
@@ -169,7 +200,9 @@ class FrameBuffer:
                 return self._cv.wait_for(lambda: self._generation != seen_gen, timeout=timeout)
 
         seen_gen = self._generation
-        await loop.run_in_executor(None, _wait_for_new_generation, seen_gen)
+        await loop.run_in_executor(
+            self._ensure_wait_executor(), _wait_for_new_generation, seen_gen
+        )
         return self.read()
 
     async def __aiter__(self) -> AsyncIterator[Frame]:
@@ -210,6 +243,17 @@ class FrameBuffer:
         """
         self._arr_a = None  # type: ignore[assignment]
         self._arr_b = None  # type: ignore[assignment]
+
+        # Wake any parked next_frame() waiter so its thread can exit,
+        # then shut the dedicated wait pool down. Without the notify, a
+        # waiter blocked on cv.wait_for would hold its thread until its
+        # own timeout, stalling executor shutdown.
+        with self._cv:
+            self._generation += 1
+            self._cv.notify_all()
+        if self._wait_executor is not None:
+            self._wait_executor.shutdown(wait=False)
+            self._wait_executor = None
 
         for seg in (self._shm_a, self._shm_b, self._shm_meta):
             try:

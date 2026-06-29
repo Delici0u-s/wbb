@@ -81,9 +81,47 @@ class X11Placement:
         self._disp.flush()
 
     def set_position(self, x: int, y: int, width: int, height: int) -> None:
-        if not self._active or self._window is None:
+        if not self._active or self._window is None or self._disp is None:
             return
-        self._window.configure(x=x, y=y)
+        from Xlib import X  # noqa: PLC0415
+        from Xlib.protocol import event as xevent  # noqa: PLC0415
+
+        # IMPORTANT: a raw XConfigureWindow / window.configure(x=, y=) on a
+        # window the WM *manages* is delivered to the compositor as an
+        # ordinary ConfigureRequest, which KWin is free to reinterpret or
+        # re-place (apply placement policy, snap to a work area, etc.). On
+        # KDE/X11 the net effect is that the position you ask for is
+        # silently overridden — the window won't move where requested even
+        # though the coordinates are valid. (This is why a manual
+        # alt+F3 → Move works but a scripted configure doesn't: different
+        # code path in the WM.)
+        #
+        # The EWMH-correct way to position a managed window from a client
+        # is the _NET_MOVERESIZE_WINDOW root-window client message
+        # (freedesktop wm-spec §"Other Root Window Messages"). Window
+        # Managers treat it like a ConfigureRequest but honor the exact
+        # geometry, and with StaticGravity the (x, y) is the frame's
+        # top-left in root coordinates regardless of decorations. This
+        # mirrors how set_above() already uses an EWMH client message
+        # rather than poking properties directly.
+        #
+        # data.l[0] = gravity (low byte) + presence/source flags:
+        #   gravity      = StaticGravity (10)  -> bits 0..7
+        #   x,y,w,h present = bits 8..11        -> 0xF00
+        #   source = pager/taskbar (0b10)       -> bits 12..15 -> 0x2000
+        STATIC_GRAVITY = 10
+        flags = STATIC_GRAVITY | (0x1 << 8) | (0x1 << 9) | (0x1 << 10) | (0x1 << 11)
+        flags |= 0x2 << 12  # source indication: pager/taskbar
+
+        root = self._disp.screen().root
+        atom = self._disp.intern_atom("_NET_MOVERESIZE_WINDOW")
+        ev = xevent.ClientMessage(
+            window=self._window,
+            client_type=atom,
+            data=(32, [flags, int(x), int(y), int(width), int(height)]),
+        )
+        mask = X.SubstructureNotifyMask | X.SubstructureRedirectMask
+        root.send_event(ev, event_mask=mask)
         self._disp.flush()
 
     def supports_position(self) -> bool:
