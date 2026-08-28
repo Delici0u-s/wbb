@@ -20,11 +20,12 @@ System requirements:
 Each extra maps to a specific capability. The display window and the placement backends are optional and platform-specific, so pick the one that matches your desktop.
 
 ```bash
+pip install 'wbb[all]'        # display + both placement backends + fast-jpeg
+
 pip install 'wbb[display]'    # PySDL2 + pysdl2-dll — the SDL2 DisplayClient window
 pip install 'wbb[kde]'        # pydbus + PyGObject — KWin placement backend (KDE, X11 OR Wayland)
 pip install 'wbb[x11]'        # python-xlib — EWMH placement backend (non-KDE X11 desktops)
 pip install 'wbb[fast-jpeg]'  # PyTurboJPEG — much faster screencast JPEG decode
-pip install 'wbb[all]'        # display + both placement backends + fast-jpeg
 pip install 'wbb[dev]'        # pytest, mypy, ruff
 ```
 

@@ -25,6 +25,7 @@ reader never observes a partial write.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import struct
 import threading
@@ -36,7 +37,7 @@ from typing import AsyncIterator, Optional
 import numpy as np
 
 from wbb.frame import Frame
-from wbb._shm import ShmSegment  # thin OS-agnostic wrapper (see _shm.py)
+from wbb._shm import ShmSegment, unlink_if_exists  # thin OS-agnostic wrapper (see _shm.py)
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,11 @@ log = logging.getLogger(__name__)
 #   [9..16]  double — timestamp (time.monotonic())
 _META_FMT = "<BQd"
 _META_SIZE = struct.calcsize(_META_FMT)
+
+
+#: Retry budget for copy_latest()'s seqlock. Each attempt is one
+#: full-frame memcpy plus two 17-byte metadata reads.
+_COPY_RETRIES = 32
 
 
 class FrameBuffer:
@@ -72,7 +78,29 @@ class FrameBuffer:
         height: int,
         *,
         attach: bool = False,
+        on_conflict: str = "replace",
     ) -> None:
+        """
+        `on_conflict` decides what happens when segments with this name
+        already exist (`attach=False` only):
+
+        ``"replace"`` (default)
+            Unlink the leftovers and create fresh ones, with a warning
+            naming each. POSIX shared memory outlives the process that
+            created it, so a run killed before `unlink()` leaves
+            `/dev/shm/<name>_a` behind and every later run with the same
+            buffer name used to die at startup with a bare
+            `FileExistsError`.
+        ``"attach"``
+            Adopt the existing segments if they are large enough.
+        ``"error"``
+            The old behaviour, with a message that says what to do.
+
+        `"replace"` is wrong if a *live* process is using the same
+        buffer name — POSIX offers no way to distinguish that from a
+        leftover, so the warning is the only signal. Give concurrent
+        buffers distinct names.
+        """
         self.name = name
         self.width = width
         self.height = height
@@ -81,9 +109,15 @@ class FrameBuffer:
         self._frame_bytes = width * height * 4  # RGBA
 
         # Shared-memory segments
-        self._shm_a = ShmSegment(f"{name}_a", self._frame_bytes, attach=attach)
-        self._shm_b = ShmSegment(f"{name}_b", self._frame_bytes, attach=attach)
-        self._shm_meta = ShmSegment(f"{name}_meta", _META_SIZE, attach=attach)
+        self._shm_a = ShmSegment(
+            f"{name}_a", self._frame_bytes, attach=attach, on_conflict=on_conflict
+        )
+        self._shm_b = ShmSegment(
+            f"{name}_b", self._frame_bytes, attach=attach, on_conflict=on_conflict
+        )
+        self._shm_meta = ShmSegment(
+            f"{name}_meta", _META_SIZE, attach=attach, on_conflict=on_conflict
+        )
 
         # numpy views (zero-copy) into each buffer
         self._arr_a = np.frombuffer(self._shm_a.buf, dtype=np.uint8).reshape((height, width, 4))
@@ -115,14 +149,13 @@ class FrameBuffer:
         # not burning CPU, so this is cheap. Closed in close().
         self._wait_executor: Optional[ThreadPoolExecutor] = None
         self._wait_executor_lock = threading.Lock()
+        self._closed = False
 
     # ------------------------------------------------------------------
     # Writer interface (called by BrowserBridge)
     # ------------------------------------------------------------------
 
     def write(self, rgba: np.ndarray) -> int:
-        import time
-
         if rgba.shape != (self.height, self.width, 4):
             raise ValueError(f"Expected shape ({self.height}, {self.width}, 4), got {rgba.shape}")
 
@@ -168,12 +201,70 @@ class FrameBuffer:
         fully release the underlying mapping (see ``FrameBuffer.close``).
         Call ``frame.copy()`` to detach a frame you want to keep.
         """
+        if self._arr_a is None or self._arr_b is None:
+            raise RuntimeError(
+                f"FrameBuffer {self.name!r} is closed; read() after close() would "
+                "hand out a view into an unmapped segment."
+            )
         raw = bytes(self._shm_meta.buf[:_META_SIZE])
         idx, fid, ts = struct.unpack(_META_FMT, raw)
         arr = self._arr_a if idx == 0 else self._arr_b
         view = arr.view()
         view.flags.writeable = False
         return Frame(data=view, width=self.width, height=self.height, frame_id=fid, timestamp=ts)
+
+    def copy_latest(self, out: Optional[np.ndarray] = None) -> Optional[Frame]:
+        """Copy the latest frame out of shared memory, detached and stable.
+
+        Why this exists
+        ---------------
+        `read()` returns a zero-copy view, and the double buffer only
+        protects a reader that consumes it *immediately*. Two writes
+        (A -> B -> A) put the writer back into the segment a slow reader
+        is still looking at, and `write()` memcpys into it with no
+        interlock — so any consumer that holds a Frame across more than
+        one write interval can be handed a half-updated frame. A filter
+        chain running in a thread-pool executor is exactly that
+        consumer.
+
+        This copies under a seqlock-style check: read the metadata, copy,
+        re-read the metadata, and retry if the writer moved underneath.
+        Returns None if it could not get a clean copy in a few attempts
+        (only possible if the writer is producing faster than a memcpy,
+        i.e. never in practice).
+
+        Cost: one H*W*4 memcpy (~3.6 MB, sub-millisecond at 720p) plus
+        two 17-byte metadata reads. Pass `out=` — a preallocated array of
+        the buffer's shape — for zero per-frame allocation.
+        """
+        if self._arr_a is None or self._arr_b is None:
+            raise RuntimeError(f"FrameBuffer {self.name!r} is closed")
+        if out is None:
+            out = np.empty((self.height, self.width, 4), dtype=np.uint8)
+        # A writer running flat out in another thread can invalidate a
+        # copy several times in a row, so the retry budget has to be
+        # generous and has to yield between attempts — with the GIL, a
+        # tight retry loop can starve the very writer it is waiting for.
+        for attempt in range(_COPY_RETRIES):
+            if attempt:
+                time.sleep(0)
+            raw = bytes(self._shm_meta.buf[:_META_SIZE])
+            idx, fid, ts = struct.unpack(_META_FMT, raw)
+            np.copyto(out, self._arr_a if idx == 0 else self._arr_b)
+            raw2 = bytes(self._shm_meta.buf[:_META_SIZE])
+            if raw2 == raw:
+                view = out.view()
+                view.flags.writeable = False
+                return Frame(
+                    data=view, width=self.width, height=self.height,
+                    frame_id=fid, timestamp=ts,
+                )
+        # Never happens against a paced writer; if it does, the caller
+        # falls back to the zero-copy view, which is what it would have
+        # used anyway before this method existed.
+        log.debug("copy_latest: writer outran the reader after %d attempts",
+                  _COPY_RETRIES)
+        return None
 
     # ------------------------------------------------------------------
     # Async interface
@@ -205,6 +296,50 @@ class FrameBuffer:
         )
         return self.read()
 
+    def __del__(self) -> None:
+        """Best-effort release for a buffer that was never closed.
+
+        Not a substitute for `close()`/`unlink()` — this cannot unlink,
+        because a segment may legitimately outlive this process. What it
+        does is stop CPython's own `SharedMemory.__del__` from printing
+        `BufferError: cannot close exported pointers exist` as an
+        "exception ignored in deallocator" traceback for every abandoned
+        buffer, which is noise that says nothing useful and looks like a
+        crash.
+        """
+        try:
+            if not getattr(self, "_closed", True):
+                self.close(collect=False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def cleanup(name: str) -> int:
+        """Remove leftover segments for `name`. Returns how many were removed.
+
+        For cleaning up after a process that died before its own
+        `unlink()` ran. Safe to call when nothing is there.
+        """
+        return sum(
+            unlink_if_exists(f"{name}_{suffix}") for suffix in ("a", "b", "meta")
+        )
+
+    def wake(self) -> None:
+        """Wake every parked next_frame() without committing a new frame.
+
+        The generation counter is bumped, so a waiter returns
+        immediately and re-reads the currently committed frame — same
+        frame_id as before, which is how a caller tells "woken" from
+        "new frame". Used by DisplayClient.request_repaint(); previously
+        the only way to do this was to bump `_generation` under `_cv`
+        yourself.
+
+        O(1), no allocation, safe from any thread.
+        """
+        with self._cv:
+            self._generation += 1
+            self._cv.notify_all()
+
     async def __aiter__(self) -> AsyncIterator[Frame]:
         while True:
             yield await self.next_frame()
@@ -213,9 +348,17 @@ class FrameBuffer:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def close(self) -> None:
+    def close(self, *, collect: bool = True) -> None:
         """
         Release this process's memory mappings. Call once when done.
+
+        `collect=True` (default) runs one `gc.collect()` after dropping
+        this object's own views and before releasing the segments. That
+        reclaims Frames that are only reachable from a reference cycle
+        or from the interpreter's last-expression slot — the common
+        real-world cause of the BufferError below — without changing the
+        contract: a Frame you are still holding in a live local still
+        blocks the release, and still only logs.
 
         Lifetime contract
         ------------------
@@ -241,16 +384,22 @@ class FrameBuffer:
         caller is still holding a view, since that is recoverable once
         the caller drops it and lets normal garbage collection proceed.
         """
-        self._arr_a = None  # type: ignore[assignment]
-        self._arr_b = None  # type: ignore[assignment]
-
-        # Wake any parked next_frame() waiter so its thread can exit,
-        # then shut the dedicated wait pool down. Without the notify, a
-        # waiter blocked on cv.wait_for would hold its thread until its
-        # own timeout, stalling executor shutdown.
+        # Wake parked waiters BEFORE tearing anything down. The old order
+        # nulled the arrays first, so a waiter woken by the notify below
+        # went straight into read() and hit an AttributeError on a None
+        # array — a shutdown-ordering crash in the reader, not the writer.
+        # read() now also raises a clear RuntimeError if it loses that
+        # race anyway.
+        self._closed = True
         with self._cv:
             self._generation += 1
             self._cv.notify_all()
+
+        self._arr_a = None  # type: ignore[assignment]
+        self._arr_b = None  # type: ignore[assignment]
+        if collect:
+            gc.collect()
+
         if self._wait_executor is not None:
             self._wait_executor.shutdown(wait=False)
             self._wait_executor = None

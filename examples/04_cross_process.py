@@ -8,10 +8,10 @@ Demonstrates:
 
 Run with two terminals:
     # Terminal A (renderer):
-    python examples/04_cross_process.py renderer "https://www.clocktab.com/"
+    python 04_cross_process.py renderer "https://www.clocktab.com/"
 
     # Terminal B (viewer):
-    python examples/04_cross_process.py viewer
+    python 04_cross_process.py viewer
 """
 
 import asyncio

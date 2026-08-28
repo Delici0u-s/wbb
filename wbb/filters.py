@@ -317,3 +317,24 @@ def chain(*filters: Filter) -> Filter:
 def identity() -> Filter:
     """Pass-through: returns the frame unchanged."""
     return lambda frame: frame
+
+
+# ---------------------------------------------------------------------
+# Alpha / transparency filters
+#
+# Re-exported from wbb.filters_alpha so `filters.opacity(...)` and
+# friends sit next to the colour and geometry filters. They only have a
+# visible effect on a window created with DisplayClient(alpha=True);
+# see that module's docstring.
+# ---------------------------------------------------------------------
+from wbb.filters_alpha import (  # noqa: E402
+    alpha_color_key,
+    alpha_ellipse,
+    alpha_gradient,
+    alpha_mask,
+    alpha_rect,
+    alpha_regions,
+    alpha_rounded_rect,
+    opacity,
+    premultiply,
+)

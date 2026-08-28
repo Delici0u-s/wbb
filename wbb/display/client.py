@@ -90,7 +90,11 @@ from typing import Any, Optional
 
 import numpy as np
 
+from .. import _compat
+from .. import filters_alpha as _filters_alpha
+from .geometry import Anchor, anchored_origin
 from .placement import select_backend
+from .window_type import WindowType
 from ._window import SDLWindow, list_displays
 
 log = logging.getLogger(__name__)
@@ -142,7 +146,10 @@ class DisplayClient:
         module docstring point 3) — must still be safe to call from a
         thread other than the one that constructed them; wbb's own
         filters.py functions all are (pure functions over numpy
-        arrays, no shared mutable state).
+        arrays, no shared mutable state). The last filter's output
+        array may be mutated in place before upload (see
+        ``premultiply`` and ``_prepare_alpha``), so a filter must not
+        return a buffer it intends to reuse on a later frame.
     on_mouse_event / on_key_event / on_scroll_event:
         Same callback signatures as the old GTK4 client.
     window_size:
@@ -210,6 +217,16 @@ class DisplayClient:
         borderless: bool = False,
         click_through: bool = False,
         max_fps: float = 60.0,
+        resizable: bool = True,
+        window_type: WindowType = WindowType.NORMAL,
+        alpha: bool = False,
+        gamescope_overlay: bool = False,
+        anchor: Anchor = Anchor.TOP_LEFT,
+        idle_repaint_interval: float = 0.25,
+        x11_display_name: Optional[str] = None,
+        debug_frames: bool = False,
+        close_on_window_close: bool = False,
+        premultiply: bool = True,
     ) -> None:
         if position is not None and not (
             isinstance(position, tuple)
@@ -242,6 +259,30 @@ class DisplayClient:
         self._click_through_active = False
         self._max_fps = max_fps
         self._min_frame_interval = (1.0 / max_fps) if max_fps > 0 else 0.0
+        self._resizable = resizable
+        self._window_type = window_type
+        self._alpha = alpha
+        self._gamescope_overlay = gamescope_overlay
+        self._anchor = Anchor(anchor)
+        self._idle_repaint_interval = 0.0 if _compat.LEGACY_PARK else idle_repaint_interval
+        self._debug_frames = debug_frames
+        self._debug_pushes = 0
+        self._close_on_window_close = close_on_window_close
+        self._premultiply = premultiply
+        self._pm_scratch: Optional[np.ndarray] = None
+        self._x11_display_name = x11_display_name
+
+        # The window's *current* size, kept up to date as push_frame
+        # resizes it. Previously the only size anywhere near placement
+        # was the construction size, so every re-placement after a
+        # resize sent stale geometry.
+        self._current_size: tuple[int, int] = (0, 0)
+        self._last_frame_id: int = -1
+        self._repaint_pending: bool = False
+        self._refilter_pending: bool = False
+        self._last_frame: Any = None
+        # Reusable landing pad for copy_latest(); see _stable_frame().
+        self._scratch: Optional[np.ndarray] = None
 
         self._win: Optional[SDLWindow] = None
         self._placement = None
@@ -268,12 +309,18 @@ class DisplayClient:
         self._caller_loop = asyncio.get_running_loop()
 
         init_w, init_h = self._fixed_window_size or (self._buf.width, self._buf.height)
+        self._current_size = (init_w, init_h)
         self._win = SDLWindow(
             init_w,
             init_h,
             title=self._title,
             wm_class=self._wm_class,
             borderless=self._borderless,
+            resizable=self._resizable,
+            window_type=self._window_type,
+            alpha=self._alpha,
+            gamescope_overlay=self._gamescope_overlay,
+            x11_display_name=self._x11_display_name,
         )
 
         handle = self._win.native_handle()
@@ -284,7 +331,7 @@ class DisplayClient:
         # at all, e.g. a window that was already mapped from a prior
         # run via set_position()), this is all that's needed. The
         # retries below are what catch the case where this one is lost.
-        self._apply_placement(init_w, init_h)
+        self._apply_placement()
 
         if self._click_through_requested:
             self._click_through_active = self._placement.set_click_through(True)
@@ -301,7 +348,7 @@ class DisplayClient:
                     # on the single attempt above landing after the
                     # window is actually mapped.
                     self._placement_retries_remaining -= 1
-                    self._apply_placement(init_w, init_h)
+                    self._apply_placement()
 
                 for ev in self._win.poll_events():
                     await self._dispatch_event(ev)
@@ -310,12 +357,36 @@ class DisplayClient:
                 if self._stop_requested:
                     break
 
-                # See module docstring point 3: next_frame() does NOT
-                # return None on timeout (wbb.buffer.FrameBuffer's
-                # cv.wait_for result is discarded internally), it
-                # re-reads whatever was last committed — harmless to
-                # re-push, not a correctness issue.
-                frame = await self._buf.next_frame(timeout=1.0)
+                # next_frame() does NOT signal a timeout — it re-reads
+                # whatever was last committed. frame_id is what tells
+                # "new frame" apart from "the park expired", so the
+                # filter chain does not re-run on a frame already
+                # rendered. The park is short (idle_repaint_interval)
+                # rather than 1.0s so a window whose page has stopped
+                # painting still self-heals after a resize.
+                frame = await self._buf.next_frame(timeout=self._idle_repaint_interval or 1.0)
+
+                if frame.frame_id == 0:
+                    # Nothing has ever been committed to this buffer. The
+                    # zeroed segment is not a frame; pushing it paints the
+                    # window solid black until the first real frame lands.
+                    await asyncio.sleep(0)
+                    continue
+
+                if frame.frame_id == self._last_frame_id:
+                    if self._refilter_pending:
+                        self._refilter_pending = False
+                        self._repaint_pending = False
+                        arr = await self._run_filters(self._stable_frame(frame))
+                        new_h, new_w = int(arr.shape[0]), int(arr.shape[1])
+                        if (new_w, new_h) != self._current_size:
+                            self._on_size_change(new_w, new_h)
+                        self._win.push_frame(self._prepare_alpha(arr))
+                    elif self._repaint_pending:
+                        self._repaint_pending = False
+                        self._win.present_again()
+                    await asyncio.sleep(0)
+                    continue
 
                 now = time.monotonic()
                 if self._min_frame_interval and (now - last_push) < self._min_frame_interval:
@@ -330,14 +401,138 @@ class DisplayClient:
                     continue
                 last_push = now
 
-                arr = await self._run_filters(frame.data)
-                self._win.push_frame(arr)
+                data = self._stable_frame(frame)
+                arr = await self._run_filters(data)
+                self._last_frame_id = frame.frame_id
+                self._repaint_pending = False
+                self._refilter_pending = False
+
+                # Send the new geometry BEFORE push_frame's
+                # SDL_SetWindowSize, so the WM sees one geometry change
+                # carrying the new origin and the new size together
+                # rather than a resize now and a move a frame later.
+                new_h, new_w = int(arr.shape[0]), int(arr.shape[1])
+                if (new_w, new_h) != self._current_size:
+                    self._on_size_change(new_w, new_h)
+
+                # _prepare_alpha, not push_frame(arr) directly. This is
+                # the path every frame takes; the re-filter branch above
+                # is only reached after set_filters(). Missing it here
+                # meant an alpha window uploaded straight (unassociated)
+                # alpha for its entire lifetime, which a premultiplied
+                # compositor renders as opaque — see _prepare_alpha.
+                arr = self._prepare_alpha(arr)
+                resized = self._win.push_frame(arr)
+                if self._debug_frames:
+                    self._log_push(frame, arr, resized)
 
                 await asyncio.sleep(0)
         finally:
             if self._win is not None:
                 self._win.close()
                 self._win = None
+
+    def _prepare_alpha(self, arr: np.ndarray) -> np.ndarray:
+        """Premultiply the frame if the window has a real alpha visual.
+
+        X11 composites 32-bit ARGB windows with premultiplied alpha —
+        XRender's PictOpOver, and `glBlendFunc(GL_ONE,
+        GL_ONE_MINUS_SRC_ALPHA)` in KWin's OpenGL backend. Straight
+        (unassociated) alpha, which is what every intuitive way of
+        writing an alpha channel produces, is misread by that: white
+        with alpha 0 means "full-intensity white at zero coverage" and
+        renders as opaque white, not as nothing. Chrome's PNG frames hit
+        the same rule but happen to survive it, because their
+        transparent regions are (0, 0, 0, 0) and black is the one colour
+        identical under both conventions.
+
+        Doing this once here rather than inside each alpha filter means
+        it cannot be applied twice, and it covers frames whose alpha came
+        from the decoder rather than from a filter.
+
+        Cost: nothing when the window is opaque, and nothing when the
+        frame is fully opaque (`alpha.min() == 255` short-circuits).
+        Otherwise one uint16 multiply over H*W*4 out of a workspace
+        cached per frame shape — no per-frame allocation. Pass
+        premultiply=False if your frames are already premultiplied, or
+        set WBB_LEGACY_PREMULTIPLY=1 to disable it without touching the
+        call site.
+
+        Mutates `arr` in place when it is writeable, which it is
+        whenever a filter chain produced it. Filters must therefore
+        return an array the client may own — every filter in
+        wbb.filters does (each returns a fresh `frame.copy()`). A
+        third-party filter that returns a buffer it keeps and reuses
+        across frames would be corrupted and double-premultiplied.
+        """
+        if (
+            not self._premultiply
+            or _compat.LEGACY_PREMULTIPLY
+            or self._win is None
+            or not self._win.alpha_active
+        ):
+            return arr
+        if arr.flags.writeable:
+            _filters_alpha._premultiply_inplace(arr)
+            return arr
+        # Read-only view straight out of shared memory (no filters
+        # configured): premultiply into a reusable scratch array so this
+        # stays allocation-free per frame.
+        if self._pm_scratch is None or self._pm_scratch.shape != arr.shape:
+            self._pm_scratch = np.empty(arr.shape, dtype=np.uint8)
+        np.copyto(self._pm_scratch, arr)
+        _filters_alpha._premultiply_inplace(self._pm_scratch)
+        return self._pm_scratch
+
+    def _log_push(self, frame: Any, arr: np.ndarray, resized: bool) -> None:
+        """One line per pushed frame: everything needed to tell a data
+        problem from a window problem.
+
+        `mean` is the giveaway. Black window + nonzero mean => the pixels
+        are fine and the problem is SDL/WM side. Black window + no lines
+        at all => the render loop never reached push_frame.
+        """
+        self._debug_pushes += 1
+        if self._debug_pushes > 1 and self._debug_pushes % 30 != 0:
+            return
+        win_w, win_h = self._win.size() if self._win is not None else (-1, -1)
+        log.warning(
+            "push #%d fid=%s arr=%s %s contig=%s mean=%.1f alpha_mean=%.1f "
+            "tex=%s win=%dx%d resized=%s",
+            self._debug_pushes,
+            frame.frame_id,
+            arr.shape,
+            arr.dtype,
+            arr.flags["C_CONTIGUOUS"],
+            float(arr[..., :3].mean()),
+            float(arr[..., 3].mean()),
+            getattr(self._win, "_tex_size", None),
+            win_w,
+            win_h,
+            resized,
+        )
+
+    def _stable_frame(self, frame: Any) -> np.ndarray:
+        """Frame pixels that will not change under us while filters run.
+
+        `frame.data` is a live view into shared memory, and the writer
+        keeps flipping between only two segments — so a filter chain
+        running in a thread-pool executor for longer than two frame
+        intervals can be reading a segment the writer has re-entered.
+        With filters configured, copy once into a reusable scratch array
+        (one memcpy, no per-frame allocation); with no filters the array
+        goes straight into push_frame's memmove on this same thread, so
+        the exposure is microseconds and the copy is not worth paying.
+        """
+        if not self._filters or _compat.LEGACY_STABLE_FRAME:
+            return frame.data
+        copy_latest = getattr(self._buf, "copy_latest", None)
+        if not callable(copy_latest):
+            return frame.data
+        if self._scratch is None or self._scratch.shape != frame.data.shape:
+            self._scratch = np.empty(frame.data.shape, dtype=np.uint8)
+        stable = copy_latest(self._scratch)
+        return stable.data if stable is not None else frame.data
 
     async def _run_filters(self, arr: np.ndarray) -> np.ndarray:
         """
@@ -425,13 +620,13 @@ class DisplayClient:
     # ------------------------------------------------------------------
     # Placement application (used by both startup and the retry window)
     # ------------------------------------------------------------------
-    def _apply_placement(self, width: int, height: int) -> None:
+    def _apply_placement(self) -> None:
         """
-        Re-send always_on_top/position to the active placement
-        backend, if either was requested. Idempotent and cheap enough
-        to call repeatedly — see module docstring point 4 for why this
-        needs to happen more than once early on, rather than exactly
-        once at startup.
+        Re-send always_on_top/position to the active placement backend,
+        using the window's CURRENT size — not the construction size.
+
+        Idempotent and cheap enough to call repeatedly; see module
+        docstring point 4 for why this happens more than once early on.
         """
         if self._placement is None:
             return
@@ -441,7 +636,37 @@ class DisplayClient:
             gx, gy = self._resolve_global_position(
                 self._monitor_index, self._requested_local_position
             )
-            self._placement.set_position(gx, gy, width, height)
+            w, h = self._current_size
+            self._placement.set_position(gx, gy, w, h)
+
+    def _on_size_change(self, new_w: int, new_h: int) -> None:
+        """The next frame has a different shape; re-anchor and re-place.
+
+        With anchor=TOP_LEFT this only records the new size (SDL's own
+        resize already keeps the top-left fixed). With any other anchor
+        it recomputes the origin so the anchored point stays put, and
+        issues the move+resize as a single placement call —
+        _NET_MOVERESIZE_WINDOW and KWin's frameGeometry both carry
+        x/y/w/h together, so it is one geometry change, not two.
+        """
+        old_w, old_h = self._current_size
+        if self._anchor is not Anchor.TOP_LEFT and self._position_requested:
+            self._requested_local_position = anchored_origin(
+                self._anchor,
+                self._requested_local_position[0],
+                self._requested_local_position[1],
+                old_w,
+                old_h,
+                new_w,
+                new_h,
+            )
+        self._current_size = (new_w, new_h)
+        if self._position_requested and self._placement is not None:
+            if self._placement.supports_position():
+                gx, gy = self._resolve_global_position(
+                    self._monitor_index, self._requested_local_position
+                )
+                self._placement.set_position(gx, gy, new_w, new_h)
 
     # ------------------------------------------------------------------
     # Placement passthroughs
@@ -512,7 +737,14 @@ class DisplayClient:
         # own sentinel rather than reusing None.
         mon = self._monitor_index if monitor is _KEEP else monitor  # type: ignore[assignment]
 
-        w, h = self._fixed_window_size or (self._buf.width, self._buf.height)
+        w, h = (
+            self._current_size
+            or self._fixed_window_size
+            or (
+                self._buf.width,
+                self._buf.height,
+            )
+        )
         self._position_requested = True
         self._requested_local_position = pos
         self._monitor_index = mon  # type: ignore[assignment]
@@ -535,6 +767,100 @@ class DisplayClient:
             x=self._requested_local_position[0], y=self._requested_local_position[1]
         )
 
+    def set_geometry(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        *,
+        monitor: "Optional[int] | object" = _KEEP,
+    ) -> None:
+        """Move and resize in one call.
+
+        Both placement backends carry x/y/w/h in a single message
+        (_NET_MOVERESIZE_WINDOW on X11; frameGeometry under KWin), so
+        this is atomic from the window manager's point of view — unlike
+        set_position() followed by waiting for push_frame to resize,
+        which gives one frame where position and size disagree.
+
+        The size given here is what gets sent to the WM now; the next
+        frame with a different shape will still resize the window
+        (that is what push_frame does), re-anchored per `anchor=`.
+
+        No-op before run_async() has created the window.
+        """
+        if self._win is None or self._placement is None:
+            return
+        mon = self._monitor_index if monitor is _KEEP else monitor  # type: ignore[assignment]
+        self._monitor_index = mon  # type: ignore[assignment]
+        self._position_requested = True
+        self._requested_local_position = (x, y)
+        self._current_size = (width, height)
+        gx, gy = self._resolve_global_position(mon, (x, y))  # type: ignore[arg-type]
+        if self._placement.supports_position():
+            self._placement.set_position(gx, gy, width, height)
+
+    def set_filters(self, filters: "Optional[list]") -> None:
+        """Replace the filter chain while the loop is running.
+
+        The list is swapped atomically from the loop's point of view —
+        the render loop reads `self._filters` once per frame and the
+        assignment is a single bytecode — so a chain is never applied
+        half-old and half-new. Takes effect on the next frame, and
+        requests a repaint so a static page updates immediately rather
+        than waiting for one.
+        """
+        self._filters = list(filters or [])
+        self._scratch = None
+        # A repaint alone only re-presents the texture that is already
+        # uploaded; the filter chain runs when a *new* frame arrives. On
+        # a page that has stopped painting there is no new frame, so a
+        # filter swap would never become visible. Flag a re-filter, which
+        # re-runs the chain over the frame currently in the buffer.
+        self._refilter_pending = True
+        self.request_repaint()
+
+    def request_repaint(self) -> None:
+        """Ask the render loop to present the current frame again.
+
+        The loop parks in next_frame(); a page that has stopped painting
+        produces no screencast frames, so nothing presents the window
+        until the park expires. This flags a repaint and wakes the
+        buffer so the loop returns immediately instead of waiting out
+        idle_repaint_interval.
+        """
+        self._repaint_pending = True
+        wake = getattr(self._buf, "wake", None)
+        if callable(wake):
+            wake()
+
+    def current_size(self) -> tuple[int, int]:
+        """The size the client believes the window is, per the last frame.
+
+        Compare against SDLWindow.size() if you suspect the window
+        manager refused a resize — they diverge silently otherwise.
+        """
+        return self._current_size
+
+    def is_alpha_active(self) -> bool:
+        """True if the window really has a per-pixel alpha visual.
+
+        False when alpha= was not requested, or was requested and could
+        not be satisfied (no 32-bit visual, no python-xlib). Same
+        contract as is_click_through_active(): a checked capability,
+        not a promise.
+        """
+        return bool(self._win is not None and getattr(self._win, "alpha_active", False))
+
+    def is_window_type_active(self) -> bool:
+        """True if the requested window_type was written to the window.
+
+        False on WindowType.NORMAL (nothing to write), on non-X11
+        subsystems, and when python-xlib is unavailable.
+        """
+        return bool(self._win is not None and getattr(self._win, "window_type_active", False))
+
     def set_always_on_top(self, above: bool) -> None:
         if self._placement is not None:
             self._placement.set_above(above)
@@ -556,7 +882,26 @@ class DisplayClient:
     async def _dispatch_event(self, ev: dict) -> None:
         kind = ev["kind"]
         if kind == "quit":
+            log.info("render loop stopping: SDL_QUIT")
             self._stop_requested = True
+        elif kind == "window":
+            et = ev["event_type"]
+            if et == "close":
+                # Opt-in: before 0.1.5 SDL_WINDOWEVENT was not decoded at
+                # all, so a CLOSE could never stop the loop. Making it
+                # stop by default turned out to end the loop on windows
+                # nobody asked to close, so the old behaviour is the
+                # default and the event is still delivered to on_window.
+                if self._close_on_window_close:
+                    log.info("render loop stopping: window close event")
+                    self._stop_requested = True
+            elif et in ("expose", "resize"):
+                # The window's contents are undefined after an expose or
+                # a WM-driven resize. Re-present what is already in the
+                # texture instead of leaving it until the next frame,
+                # which may be a whole park away.
+                if self._win is not None:
+                    self._win.present_again()
         elif kind == "mouse" and self._on_mouse is not None:
             await self._fire_callback(
                 self._on_mouse, ev["event_type"], ev["x"], ev["y"], ev["button"]

@@ -24,14 +24,13 @@ Override with ``CHROME_PATH`` env var.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -39,20 +38,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Optional, Union, overload
 
-import numpy as np
 import websockets
-from PIL import Image
 
-# optional dependency, falls back to Pillow if unavailable
-try:
-    from turbojpeg import TJPF_RGBA, TurboJPEG
-
-    _turbo = TurboJPEG()
-except ImportError:
-    _turbo = None
-    TJPF_RGBA = None  # type: ignore[assignment]
-
+from wbb import _compat
 from wbb.buffer import FrameBuffer
+from wbb.codec import decode_frame, turbojpeg_available
 from wbb.frame import Frame
 
 log = logging.getLogger(__name__)
@@ -111,10 +101,19 @@ class _HookRegistry:
         self._hooks.setdefault(event, []).append(cb)
 
     async def fire(self, event: str, **kwargs: Any) -> None:
+        # One raising callback must not take out the CDP recv loop, which
+        # is what happened before: fire() is awaited inline from
+        # _recv_loop, so an exception here killed the socket drain and
+        # every pending _send() hung forever with no error anywhere.
         for cb in self._hooks.get(event, []):
-            result = cb(**kwargs)
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = cb(**kwargs)
+                if asyncio.iscoroutine(result):
+                    await result
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Error in %r event hook %r", event, cb)
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +134,12 @@ class BrowserBridge:
     screencast_quality:
         JPEG quality (1–100) for the CDP screencast stream.
     screencast_max_fps:
-        Maximum frames per second to request from Chrome.
+        Upper bound on frames per second. Enforced by pacing the
+        screencast acknowledgements in wall-clock time, so a page that
+        paints rarely still delivers every frame it produces. (Chrome's
+        own ``everyNthFrame`` counts compositor frames instead, which
+        silently starves static pages; it is only used on the legacy
+        ``ack_after_write=False`` path.)
     enable_input:
         If False, all ``click`` / ``key`` / ``type`` methods raise.
         Setting this explicitly to True enables input; False disables
@@ -155,7 +159,12 @@ class BrowserBridge:
         enable_input: Optional[bool] = None,
         headless_args: Optional[list[str]] = None,
         extra_headers: Optional[dict[str, str]] = None,
+        screencast_format: str = "jpeg",
+        transparent_background: bool = False,
+        ack_after_write: bool = True,
     ) -> None:
+        if screencast_format not in ("jpeg", "png"):
+            raise ValueError(f"screencast_format must be 'jpeg' or 'png', got {screencast_format!r}")
         self._buf = buffer
         self._width = width
         self._height = height
@@ -163,6 +172,20 @@ class BrowserBridge:
         self._sfps = screencast_max_fps
         self._input_enabled = enable_input is not False
         self._extra_args = headless_args or []
+        self._screencast_format = screencast_format
+        self._transparent = transparent_background
+        self._ack_after_write = ack_after_write and not _compat.LEGACY_ACK
+        self._min_screencast_interval = (
+            1.0 / screencast_max_fps if screencast_max_fps and self._ack_after_write else 0.0
+        )
+        self._last_ack_at = 0.0
+        if transparent_background and screencast_format != "png":
+            log.warning(
+                "transparent_background=True with screencast_format=%r: JPEG has "
+                "no alpha channel, so every decoded pixel will be opaque. Use "
+                "screencast_format='png'.",
+                screencast_format,
+            )
 
         # Header groups: id -> {header_name: value, ...}. Re-merged and
         # pushed to CDP as a single Network.setExtraHTTPHeaders call on
@@ -180,6 +203,7 @@ class BrowserBridge:
         self._recv_task: Optional[asyncio.Task[None]] = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._running = False
+        self._drainer: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -196,9 +220,14 @@ class BrowserBridge:
             "--disable-dev-shm-usage",
             f"--window-size={self._width},{self._height}",
             "--remote-debugging-port=0",  # OS-assigned port
-            "about:blank",
-            *self._extra_args,
         ]
+        # Note: --default-background-color= is deliberately NOT passed.
+        # Its value format is undocumented, it is a Blink switch rather
+        # than a browser one, and passing it correlated with Chrome
+        # failing to publish a page target at all. The documented path is
+        # Emulation.setDefaultBackgroundColorOverride, sent below once
+        # the session is attached.
+        args += ["about:blank", *self._extra_args]
         log.debug("Launching: %s", " ".join(args))
         self._proc = subprocess.Popen(
             args,
@@ -207,8 +236,14 @@ class BrowserBridge:
         )
 
         # Wait for Chrome to print its DevTools URL
-        ws_url = await asyncio.get_event_loop().run_in_executor(None, self._read_devtools_url)
+        ws_url = await asyncio.get_running_loop().run_in_executor(None, self._read_devtools_url)
         log.debug("DevTools URL: %s", ws_url)
+
+        # From here on nobody reads Chrome's pipes. A 64 KiB pipe buffer
+        # fills in seconds on a page that logs, and Chrome then blocks in
+        # write() forever — the browser appears to freeze with no error.
+        # Drain both pipes into the logger for the process's lifetime.
+        self._start_pipe_drain()
 
         self._ws = await websockets.connect(ws_url, max_size=None)
         self._running = True
@@ -217,8 +252,7 @@ class BrowserBridge:
         # Discover the page target Chrome created for "about:blank" and
         # attach to it with a flattened session, so Page.*/Runtime.*/Input.*
         # commands have somewhere to land.
-        targets = await self._send("Target.getTargets")
-        page_target = next(t for t in targets["targetInfos"] if t["type"] == "page")
+        page_target = await self._await_page_target()
         attach_result = await self._send(
             "Target.attachToTarget",
             targetId=page_target["targetId"],
@@ -235,6 +269,16 @@ class BrowserBridge:
         if self._header_groups:
             await self._push_headers()
 
+        if self._transparent:
+            # Documented for Page.captureScreenshot; whether the screencast
+            # path honours it is NOT confirmed here — see the open questions.
+            # It is a cheap call either way and does nothing harmful if the
+            # screencast ignores it.
+            await self._send(
+                "Emulation.setDefaultBackgroundColorOverride",
+                color={"r": 0, "g": 0, "b": 0, "a": 0},
+            )
+
         # Set viewport
         await self._send(
             "Emulation.setDeviceMetricsOverride",
@@ -248,23 +292,39 @@ class BrowserBridge:
         await self._start_screencast()
 
     async def _start_screencast(self) -> None:
-        every_nth = max(1, round(60 / self._sfps)) if self._sfps else 1
-        await self._send(
-            "Page.startScreencast",
-            format="jpeg",
-            quality=self._sq,
-            maxWidth=self._width,
-            maxHeight=self._height,
-            everyNthFrame=every_nth,
-        )
-        # await self._send(
-        #     "Page.startScreencast",
-        #     format="jpeg",
-        #     quality=self._sq,
-        #     maxWidth=self._width,
-        #     maxHeight=self._height,
-        #     everyNthFrame=1,
-        # )
+        # everyNthFrame counts *compositor* frames, not wall-clock time,
+        # and a page that stops animating stops producing them. With
+        # screencast_max_fps=10 that becomes everyNthFrame=6, so a static
+        # page which paints two or three times on load and then goes
+        # quiet never reaches the sixth frame and the screencast delivers
+        # nothing at all — the page looks like it never loaded.
+        #
+        # Where ack pacing is available (ack_after_write, the default)
+        # ask for every frame and rate-limit by delaying the ack instead:
+        # Chrome will not send the next frame until we ack, so the cap is
+        # enforced in wall-clock time and a static page still delivers
+        # the frames it does produce. everyNthFrame is only used on the
+        # legacy pipelined path, where there is no ack to delay.
+        every_nth = 1
+        if not self._ack_after_write:
+            every_nth = max(1, round(60 / self._sfps)) if self._sfps else 1
+        params: dict[str, Any] = {
+            "format": self._screencast_format,
+            "maxWidth": self._width,
+            "maxHeight": self._height,
+            "everyNthFrame": every_nth,
+        }
+        if self._screencast_format == "jpeg":
+            # quality is meaningless for PNG; CDP ignores it, but sending
+            # it anyway makes the log confusing when debugging a
+            # transparency problem.
+            params["quality"] = self._sq
+        if self._screencast_format == "png" and turbojpeg_available():
+            log.debug(
+                "screencast_format='png': the libjpeg-turbo fast path does not "
+                "apply, decode goes through Pillow."
+            )
+        await self._send("Page.startScreencast", **params)
 
     async def _restart_screencast(self) -> None:
         """Stop and restart the screencast against the current page/viewport.
@@ -286,6 +346,57 @@ class BrowserBridge:
         """
         self._hooks = _HookRegistry()
 
+    async def _await_page_target(self, timeout: float = 10.0) -> dict[str, Any]:
+        """Poll Target.getTargets until Chrome's initial page target exists.
+
+        The page target for the startup URL is not always present the
+        instant the DevTools socket accepts a connection — Chrome
+        publishes the browser target first. A bare
+        `next(t for t in ... if t["type"] == "page")` therefore raises
+        StopIteration, which inside a coroutine surfaces as the useless
+        `RuntimeError: coroutine raised StopIteration`.
+        """
+        deadline = time.monotonic() + timeout
+        delay = 0.02
+        last: list[dict[str, Any]] = []
+        while True:
+            targets = await self._send("Target.getTargets")
+            last = targets.get("targetInfos", [])
+            for t in last:
+                if t.get("type") == "page":
+                    return t
+            if time.monotonic() >= deadline:
+                kinds = sorted({t.get("type", "?") for t in last})
+                raise RuntimeError(
+                    f"Chrome exposed no page target within {timeout:.0f}s "
+                    f"(saw: {', '.join(kinds) or 'nothing'}). Chrome may have "
+                    f"rejected a command-line flag; run with logging at DEBUG "
+                    f"to see its stderr."
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 0.25)
+
+    def _start_pipe_drain(self) -> None:
+        """Consume Chrome's stdout/stderr so its pipe buffers never fill."""
+
+        def _drain() -> None:
+            proc = self._proc
+            if proc is None:
+                return
+            for stream, level in ((proc.stderr, logging.DEBUG), (proc.stdout, logging.DEBUG)):
+                if stream is None:
+                    continue
+                try:
+                    for line in stream:
+                        log.log(level, "chrome: %s", line.decode(errors="replace").rstrip())
+                except Exception:
+                    return
+
+        self._drainer = threading.Thread(
+            target=_drain, name="wbb-chrome-drain", daemon=True
+        )
+        self._drainer.start()
+
     def _read_devtools_url(self) -> str:
         """Parse Chrome stderr for 'DevTools listening on ws://...'"""
         assert self._proc and self._proc.stderr
@@ -295,13 +406,41 @@ class BrowserBridge:
                 return decoded.split("DevTools listening on")[-1].strip()
         raise RuntimeError("Chrome did not emit a DevTools URL")
 
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Resolve every outstanding _send() future with *exc*.
+
+        Without this a socket close (Chrome crashed, tab closed, stop()
+        called) leaves every `await self._send(...)` parked forever with
+        no exception and no timeout — the single worst failure mode in
+        this file, because it looks like a hang, not an error.
+        """
+        pending, self._pending = self._pending, {}
+        for fut in pending.values():
+            if fut.done():
+                continue
+            fut.set_exception(exc)
+            # Read it back so asyncio does not print "Future exception was
+            # never retrieved" at GC time for a command whose awaiter was
+            # already cancelled — the common shape on Ctrl-C, where the
+            # traceback shown points confusingly at _recv_loop rather than
+            # at whatever issued the command. An awaiter that is still
+            # alive gets the exception exactly as before.
+            fut.exception()
+        if pending:
+            log.debug("failed %d pending CDP command(s): %r", len(pending), exc)
+
     async def stop(self) -> None:
-        """Stop the screencast, close the WebSocket, terminate Chrome."""
-        if not self._running:
-            return
+        """Stop the screencast, close the WebSocket, terminate Chrome.
+
+        Safe to call after a failed start(): a Chrome process that was
+        spawned before the failure is still terminated, where the old
+        `if not self._running: return` guard leaked it.
+        """
+        was_running = self._running
         self._running = False
-        with suppress(Exception):
-            await self._send("Page.stopScreencast")
+        if was_running:
+            with suppress(Exception):
+                await self._send("Page.stopScreencast")
         # Drain any in-flight screencast decode/write tasks so we don't
         # cancel a FrameBuffer write half-done. Bounded — screencast is
         # stopped, so no new ones arrive; give them a moment to finish.
@@ -312,11 +451,12 @@ class BrowserBridge:
             self._recv_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._recv_task
+        self._fail_pending(RuntimeError("BrowserBridge stopped"))
         if self._ws:
             await self._ws.close()
         if self._proc:
             self._proc.terminate()
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             try:
                 await asyncio.wait_for(loop.run_in_executor(None, self._proc.wait), timeout=5)
             except asyncio.TimeoutError:
@@ -337,6 +477,22 @@ class BrowserBridge:
     # CDP plumbing
     # ------------------------------------------------------------------
 
+    async def send_cdp(self, method: str, **params: Any) -> Any:
+        """Send a raw CDP command on this bridge's session and await its result.
+
+        The escape hatch for anything the typed API does not cover
+        (Emulation.*, Animation.*, a newer CDP method than this release
+        knows about). Same session, same id space, same error mapping as
+        every internal call — previously the only way to do this was to
+        reach into the private `_send`.
+
+        Raises RuntimeError with Chrome's message on a CDP error, or if
+        the connection closes while the command is outstanding.
+        """
+        if not self._running:
+            raise RuntimeError("BrowserBridge is not running; call start() first")
+        return await self._send(method, **params)
+
     async def _send(self, method: str, **params: Any) -> Any:
         self._cmd_id += 1
         cid = self._cmd_id
@@ -344,7 +500,7 @@ class BrowserBridge:
         if self._session_id is not None:
             payload["sessionId"] = self._session_id
         msg = json.dumps(payload)
-        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[cid] = fut
         assert self._ws
         await self._ws.send(msg)
@@ -375,6 +531,19 @@ class BrowserBridge:
         await self._ws.send(msg)
 
     async def _recv_loop(self) -> None:
+        assert self._ws
+        try:
+            await self._recv_loop_inner()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # socket error, protocol error, anything
+            log.debug("CDP recv loop ended: %r", exc)
+            self._fail_pending(exc)
+            return
+        # Normal iterator exhaustion == the socket closed.
+        self._fail_pending(RuntimeError("CDP connection closed"))
+
+    async def _recv_loop_inner(self) -> None:
         assert self._ws
         async for raw in self._ws:
             try:
@@ -434,23 +603,56 @@ class BrowserBridge:
             await self._hooks.fire("error", description=desc)
 
     async def _on_screencast_frame(self, params: dict[str, Any]) -> None:
-        # Ack immediately so Chrome keeps pushing. Fire-and-forget send
-        # (no Future, no pending-dict entry) awaited inline within this
-        # already-running task — one fewer task per frame than the old
-        # create_task(self._send("...Ack")).
+        """Decode one screencast frame and commit it to the FrameBuffer.
+
+        Ack ordering
+        ------------
+        `Page.screencastFrameAck` is Chrome's flow control: it does not
+        push the next frame until the previous one is acked. Acking
+        *before* the decode (the old behaviour) throws that away — frame
+        N+1 arrives while N is still in the executor, both tasks race to
+        `_buf.write()`, and the default executor's completion order is
+        not the arrival order, so an older frame can land on top of a
+        newer one. With `ack_after_write=True` (the default) exactly one
+        frame is ever in flight, which makes ordering structural rather
+        than lucky. Set `ack_after_write=False` to restore the old
+        pipelined behaviour if you would rather have throughput than
+        ordering.
+        """
         session_id = params.get("sessionId", 0)
-        await self._send_nowait("Page.screencastFrameAck", sessionId=session_id)
+        if not self._ack_after_write:
+            await self._send_nowait("Page.screencastFrameAck", sessionId=session_id)
 
         data = params.get("data", "")
         ts = params.get("metadata", {}).get("timestamp", time.monotonic())
+        width, height = self._width, self._height
 
-        loop = asyncio.get_running_loop()
-        rgba = await loop.run_in_executor(None, _jpeg_to_rgba, data, self._width, self._height)
-        fid = self._buf.write(rgba)
+        try:
+            loop = asyncio.get_running_loop()
+            rgba = await loop.run_in_executor(None, decode_frame, data, width, height)
+            fid = self._buf.write(rgba)
+        except Exception:
+            log.exception("screencast frame dropped")
+            return
+        finally:
+            if self._ack_after_write:
+                # In `finally` so a decode/write failure does not stall the
+                # stream permanently with no ack outstanding.
+                if self._min_screencast_interval:
+                    now = time.monotonic()
+                    wait = self._min_screencast_interval - (now - self._last_ack_at)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    self._last_ack_at = time.monotonic()
+                with suppress(Exception):
+                    await self._send_nowait(
+                        "Page.screencastFrameAck", sessionId=session_id
+                    )
+
         frame = Frame(
             data=rgba,
-            width=self._width,
-            height=self._height,
+            width=width,
+            height=height,
             frame_id=fid,
             timestamp=ts,
         )
@@ -495,6 +697,24 @@ class BrowserBridge:
         return bool(await self.eval(js, await_promise=True))
 
     async def set_viewport(self, width: int, height: int) -> None:
+        """Change the emulated viewport and re-point the screencast at it.
+
+        The FrameBuffer is fixed-size, so a viewport that no longer
+        matches it makes every subsequent `_buf.write()` raise inside a
+        background task. That is warned about here rather than
+        discovered as a stream that silently stopped.
+        """
+        buf_w = getattr(self._buf, "width", width)
+        buf_h = getattr(self._buf, "height", height)
+        if (width, height) != (buf_w, buf_h):
+            log.warning(
+                "set_viewport(%d, %d) does not match the FrameBuffer (%dx%d); "
+                "frames will be resampled to the buffer's size on decode.",
+                width,
+                height,
+                buf_w,
+                buf_h,
+            )
         self._width = width
         self._height = height
         await self._send(
@@ -504,6 +724,9 @@ class BrowserBridge:
             deviceScaleFactor=1,
             mobile=False,
         )
+        if self._running:
+            # maxWidth/maxHeight were baked in at startScreencast time.
+            await self._restart_screencast()
 
     # ------------------------------------------------------------------
     # Extra HTTP headers
@@ -946,29 +1169,10 @@ class BrowserBridge:
 # ---------------------------------------------------------------------------
 
 
-def _jpeg_to_rgba(data_b64: str, width: int, height: int) -> np.ndarray:
-    """Decode a base64 JPEG payload to an H×W×4 RGBA uint8 array.
-
-    With PyTurboJPEG present, libjpeg-turbo writes RGBA directly in a
-    single decode pass (alpha guaranteed 0xFF), so there is no BGR
-    intermediate array and no per-channel Python-driven copy. Only the
-    rare size-mismatch path allocates a second array (to LANCZOS-resize).
-    """
-    raw = base64.b64decode(data_b64)
-    if _turbo is not None:
-        rgba = _turbo.decode(raw, pixel_format=TJPF_RGBA)
-        if rgba.shape[:2] == (height, width):
-            return rgba
-        # size mismatch: resize the already-decoded RGBA array rather
-        # than re-decoding. Pillow handles RGBA directly.
-        return np.asarray(
-            Image.fromarray(rgba, mode="RGBA").resize((width, height), Image.Resampling.LANCZOS),
-            dtype=np.uint8,
-        )
-    img = Image.open(io.BytesIO(raw)).convert("RGBA")
-    if img.size != (width, height):
-        img = img.resize((width, height), Image.LANCZOS)  # type: ignore[attr-defined]
-    return np.asarray(img, dtype=np.uint8)
+#: Decode moved to wbb/codec.py (it now dispatches on the payload's magic
+#: bytes, because the screencast format is per-bridge). Re-exported so
+#: anything importing wbb.browser._jpeg_to_rgba keeps working.
+_jpeg_to_rgba = decode_frame
 
 
 # Elements considered "clickable" when resolving a text match to its
