@@ -66,17 +66,18 @@ Fixes applied after first real-desktop testing
    window manager actually starts managing the window, whereas a stale
    ``XConfigureWindow`` does not get retried.
 
-   Fix: rather than guessing a fixed startup delay (fragile — the
-   right delay depends on the machine, the compositor, and whatever
-   else happens to run before this), ``set_above()``/``set_position()``
-   are now re-sent for the first few iterations of the render loop
-   itself (see ``_PLACEMENT_RETRY_FRAMES`` below). The render loop
-   already pumps SDL events and yields to the event loop every
-   iteration, so this naturally lands the retries after the window has
-   had real wall-clock time and several event-loop turns to finish
-   mapping, while costing only a handful of extra D-Bus/Xlib
-   round-trips, only during the first few frames, only when
-   always_on_top/position were actually requested.
+   Fix, in two halves. First, a requested position is handed to
+   ``SDL_CreateWindow`` rather than ``SDL_WINDOWPOS_UNDEFINED`` (see
+   ``run_async``), so the window is *born* in the right place and the
+   compositor's own initial-placement logic has nothing to decide. That
+   is a better position to negotiate from than any amount of moving
+   afterwards. Second, ``set_above()``/``set_position()`` are re-sent
+   on a fixed wall-clock cadence for ``placement_settle`` seconds after
+   startup (``_settle_placement`` below), covering a WM that
+   repositions on map regardless, and the result is read back and
+   logged once (``_report_placement``). The readback is the important
+   part: every mechanism underneath is fire-and-forget, so before it
+   there was no way to tell a refused move from a successful one.
 """
 
 from __future__ import annotations
@@ -95,7 +96,7 @@ from .. import filters_alpha as _filters_alpha
 from .geometry import Anchor, anchored_origin
 from .placement import select_backend
 from .window_type import WindowType
-from ._window import SDLWindow, list_displays
+from ._window import SDLWindow, list_displays, preinit_alpha
 
 log = logging.getLogger(__name__)
 
@@ -104,13 +105,20 @@ MouseCallback = Callable[[str, float, float, int], Any]
 KeyCallback = Callable[[str, str], Any]
 ScrollCallback = Callable[[float, float], Any]
 
-# How many render-loop iterations to re-apply always_on_top/position
-# for after startup. See module docstring point 4 — this is what
-# absorbs the race against XWayland's first map/configure round-trip
-# without guessing a fixed sleep duration. Five frames is on the order
-# of ~100ms at a typical first-few-frames pace and has been enough in
-# practice; cheap enough to not worry about tuning further.
-_PLACEMENT_RETRY_FRAMES = 5
+# How long, in wall-clock seconds, to keep re-applying
+# always_on_top/position after startup, and how far apart the attempts
+# are spaced. See module docstring point 4 for what this absorbs.
+#
+# This used to be a count of render-loop iterations (five), on the
+# assumption that five iterations is "on the order of ~100ms". It is
+# not: an iteration lasts until the frame buffer's generation counter
+# moves (buffer.py's next_frame), so the same five iterations span
+# ~330ms at a 15fps screencast and ~80ms at 60fps. The duration that
+# matters here is the window manager's, not the page's, so it is now
+# measured in seconds and the attempt rate is fixed independently of
+# frame rate.
+_PLACEMENT_SETTLE_SECONDS = 0.75
+_PLACEMENT_ATTEMPT_INTERVAL = 0.1
 
 
 # Sentinel for set_position(monitor=...): distinguishes "argument omitted,
@@ -192,6 +200,13 @@ class DisplayClient:
         you need to know whether it actually took effect — see point 2
         in the module docstring for why this one in particular matters
         to check, unlike always_on_top/position.
+    placement_settle:
+        Seconds after startup (and after each ``set_position()``) during
+        which always_on_top/position are re-asserted, roughly every
+        100ms, before the requested-vs-actual result is logged once.
+        Default 0.75. Set to 0 to apply placement exactly once and
+        report immediately — useful if you are re-placing the window
+        yourself and do not want the library competing with you.
     max_fps:
         Caps how often frames are pushed to the window, independent of
         the renderer's own vsync (which may silently be unavailable —
@@ -227,6 +242,7 @@ class DisplayClient:
         debug_frames: bool = False,
         close_on_window_close: bool = False,
         premultiply: bool = True,
+        placement_settle: float = _PLACEMENT_SETTLE_SECONDS,
     ) -> None:
         if position is not None and not (
             isinstance(position, tuple)
@@ -289,11 +305,22 @@ class DisplayClient:
         self._stop_requested = False
         self._caller_loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # See module docstring point 4 / _PLACEMENT_RETRY_FRAMES.
-        # Counts down once run_async()'s loop starts; while > 0, each
-        # iteration re-applies always_on_top/position before doing
-        # anything else.
-        self._placement_retries_remaining = _PLACEMENT_RETRY_FRAMES
+        # See module docstring point 4 / _PLACEMENT_SETTLE_SECONDS. The
+        # deadline is armed when run_async()'s loop starts (and re-armed
+        # by set_position); until it passes, each attempt re-applies
+        # always_on_top/position. _placement_reported makes the
+        # requested-vs-actual summary fire exactly once per settle
+        # window rather than once per attempt.
+        self._placement_settle = max(0.0, float(placement_settle))
+        self._placement_deadline = 0.0
+        self._placement_next_attempt = 0.0
+        self._placement_reported = True
+        # The "nothing moved it" warning is long and actionable exactly
+        # once. On a window manager that never honours a move, every
+        # later set_position() would otherwise repeat it verbatim, which
+        # turns a useful diagnostic into noise that hides the next real
+        # one. Fires in full the first time, at debug after that.
+        self._placement_failure_logged = False
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -310,6 +337,29 @@ class DisplayClient:
 
         init_w, init_h = self._fixed_window_size or (self._buf.width, self._buf.height)
         self._current_size = (init_w, init_h)
+
+        # Resolve the requested position BEFORE creating the window, so
+        # it can be handed to SDL_CreateWindow instead of
+        # SDL_WINDOWPOS_UNDEFINED. A window born at the right place
+        # never gives the window manager's placement policy a chance to
+        # decide otherwise, which is a strictly better position to
+        # negotiate from than moving it afterwards. The placement
+        # backend still re-asserts the position during the settle window
+        # below, because a WM may reposition on map regardless.
+        init_pos: Optional[tuple[int, int]] = None
+        if self._position_requested:
+            if self._alpha and self._monitor_index is not None:
+                # Monitor-local resolution calls list_displays(), which
+                # initialises SDL video — and the ARGB visual has to be
+                # chosen before that happens or the window comes out
+                # 24-bit (see display/alpha.py's prepare()). Global mode
+                # (monitor=None) short-circuits without touching SDL, so
+                # this is only needed for the int case.
+                preinit_alpha(self._x11_display_name)
+            init_pos = self._resolve_global_position(
+                self._monitor_index, self._requested_local_position
+            )
+
         self._win = SDLWindow(
             init_w,
             init_h,
@@ -321,34 +371,28 @@ class DisplayClient:
             alpha=self._alpha,
             gamescope_overlay=self._gamescope_overlay,
             x11_display_name=self._x11_display_name,
+            position=init_pos,
         )
 
         handle = self._win.native_handle()
         self._placement = select_backend(handle, wm_class=self._wm_class)
 
-        # First attempt, same as before — on backends/compositors that
-        # don't hit the XWayland first-map race (or that aren't racing
-        # at all, e.g. a window that was already mapped from a prior
-        # run via set_position()), this is all that's needed. The
-        # retries below are what catch the case where this one is lost.
-        self._apply_placement()
-
         if self._click_through_requested:
             self._click_through_active = self._placement.set_click_through(True)
+
+        # Arming the settle window schedules the first attempt for
+        # `now`, so the loop's first iteration applies placement
+        # immediately — there is no separate up-front _apply_placement()
+        # call any more. Keeping one would have made the first attempt
+        # land before select_backend's window has had a single event-loop
+        # turn, which is the attempt most likely to be lost to the
+        # first-map race and the least worth spending a round-trip on.
+        self._arm_placement_settle()
 
         try:
             last_push = 0.0
             while not self._stop_requested:
-                if self._placement_retries_remaining > 0:
-                    # See module docstring point 4. Re-send
-                    # always_on_top/position for the first few frames
-                    # so a configure request lost to XWayland's first
-                    # map/configure round-trip gets a second (third,
-                    # fourth...) chance, instead of betting everything
-                    # on the single attempt above landing after the
-                    # window is actually mapped.
-                    self._placement_retries_remaining -= 1
-                    self._apply_placement()
+                self._settle_placement()
 
                 for ev in self._win.poll_events():
                     await self._dispatch_event(ev)
@@ -364,7 +408,9 @@ class DisplayClient:
                 # rendered. The park is short (idle_repaint_interval)
                 # rather than 1.0s so a window whose page has stopped
                 # painting still self-heals after a resize.
-                frame = await self._buf.next_frame(timeout=self._idle_repaint_interval or 1.0)
+                frame = await self._buf.next_frame(
+                    timeout=self._idle_repaint_interval or 1.0
+                )
 
                 if frame.frame_id == 0:
                     # Nothing has ever been committed to this buffer. The
@@ -639,6 +685,176 @@ class DisplayClient:
             w, h = self._current_size
             self._placement.set_position(gx, gy, w, h)
 
+    def _arm_placement_settle(self) -> None:
+        """(Re)open the window during which placement is re-asserted."""
+        now = time.monotonic()
+        self._placement_deadline = now + self._placement_settle
+        self._placement_next_attempt = now
+        self._placement_reported = False
+
+    def _settle_placement(self) -> None:
+        """Re-apply placement on a fixed wall-clock cadence, then report.
+
+        Runs the full settle window rather than stopping early on a
+        matching readback, deliberately. A window created at the right
+        position (see run_async) reads back correct from the very first
+        check, *before* the window manager has mapped it and had its own
+        say — so an early exit on "it matches" would stop re-asserting
+        exactly in the case that most needs it. The attempts are
+        idempotent and there are about eight of them; the handful of
+        round-trips saved by exiting early is not worth reintroducing
+        that race.
+
+        Cost: one placement call, plus one geometry readback on the
+        final attempt, every _PLACEMENT_ATTEMPT_INTERVAL for
+        _placement_settle seconds. Nothing at all after that, and
+        nothing per frame.
+        """
+        if self._placement_reported:
+            return
+        now = time.monotonic()
+        if now < self._placement_next_attempt:
+            return
+        self._placement_next_attempt = now + _PLACEMENT_ATTEMPT_INTERVAL
+
+        self._apply_placement()
+
+        if now < self._placement_deadline:
+            return
+
+        # The window has had a full settle window on the current
+        # mechanism and still is not where it was asked to go. If the
+        # backend has another mechanism, take it and start a fresh
+        # window; the backend keeps the choice, so every later move
+        # goes straight to whatever worked and pays nothing for the
+        # search. A readback of None (backend cannot measure) is not
+        # evidence of failure and must not advance anything.
+        if self._placement_matches() is False and self._advance_position_method():
+            self._placement_deadline = now + self._placement_settle
+            return
+
+        self._placement_reported = True
+        self._report_placement()
+
+    def _placement_matches(self) -> Optional[bool]:
+        """Is the window where it was asked to be? None if unmeasurable."""
+        if not self._position_requested or self._placement is None:
+            return None
+        if not self._placement.supports_position():
+            return None
+        got = self._placement.actual_position()
+        if got is None:
+            return None
+        want = self._resolve_global_position(
+            self._monitor_index, self._requested_local_position
+        )
+        return got == want
+
+    def _advance_position_method(self) -> bool:
+        """Ask the backend for another way to move the window.
+
+        False when the backend has none left, or is old enough not to
+        implement the hook at all — a third-party PlacementBackend
+        predating this stays working, it just does not participate in
+        the search.
+        """
+        if self._placement is None:
+            return False
+        advance = getattr(self._placement, "next_position_method", None)
+        if not callable(advance):
+            return False
+        previous = self._position_method_name()
+        if not advance():
+            return False
+        log.info(
+            "Placement: %r did not move the window; retrying with %r",
+            previous,
+            self._position_method_name(),
+        )
+        return True
+
+    def _position_method_name(self) -> str:
+        name = getattr(self._placement, "position_method", None)
+        return name() if callable(name) else "?"
+
+    def _report_placement(self) -> None:
+        """Log requested vs actual once the settle window has closed.
+
+        This is the only place the library finds out whether placement
+        worked. Every mechanism underneath is fire-and-forget: an EWMH
+        client message has no reply, and a KWin script's return value is
+        not plumbed back over D-Bus. Without this a refused move and a
+        successful one are indistinguishable from inside the process,
+        which is what makes "the window is in the wrong place" so
+        expensive to diagnose.
+        """
+        if not self._position_requested or self._placement is None:
+            return
+        want = self._resolve_global_position(
+            self._monitor_index, self._requested_local_position
+        )
+        got = self._placement.actual_position()
+        if got is None:
+            log.info(
+                "Placement: requested global position %s; the %r backend "
+                "cannot read the geometry back, so whether it took is "
+                "unknown. Check with: xwininfo -id <window> | grep Absolute",
+                want,
+                getattr(self._placement, "name", "?"),
+            )
+        elif got == want:
+            log.debug(
+                "Placement: settled at %s as requested, via %r",
+                got,
+                self._position_method_name(),
+            )
+        elif self._placement_failure_logged:
+            log.debug(
+                "Placement: requested %s, window is at %s (%r); already "
+                "reported, not repeating.",
+                want,
+                got,
+                self._position_method_name(),
+            )
+        else:
+            self._placement_failure_logged = True
+            log.warning(
+                "Placement: requested global position %s but the window is "
+                "at %s. Every positioning mechanism this backend has was "
+                "tried (last was %r) and none moved it. Things known to "
+                "cause this: a window_type the WM treats as special "
+                "(notification/OSD types are commonly excluded from "
+                "client-initiated moves), a Window Rule matching "
+                "wm_class=%r, or a placement policy applied at map time. "
+                "The position passed to the constructor is applied at "
+                "window-creation time through a different channel and may "
+                "still work where a later move does not.",
+                want,
+                got,
+                self._position_method_name(),
+                self._wm_class,
+            )
+
+    def actual_position(self) -> Optional[WindowPosition]:
+        """Where the window really is, in **global** desktop coordinates.
+
+        Note the convention difference from `get_position()`, which
+        echoes back the last position you *requested*, in whatever
+        convention you requested it (monitor-local if `monitor=` is an
+        int). This one is always global, because it is measured off the
+        window rather than remembered, and there is no monitor to
+        measure it against until you pick one.
+
+        Returns None before `run_async()` has created the window, and on
+        backends that cannot read the geometry back (currently anything
+        but X11/EWMH — see each backend's `actual_position()`). None
+        means "unknown", not "wrong".
+        """
+        if self._placement is None:
+            return None
+        pos = self._placement.actual_position()
+        return None if pos is None else WindowPosition(x=pos[0], y=pos[1])
+
     def _on_size_change(self, new_w: int, new_h: int) -> None:
         """The next frame has a different shape; re-anchor and re-place.
 
@@ -737,26 +953,21 @@ class DisplayClient:
         # own sentinel rather than reusing None.
         mon = self._monitor_index if monitor is _KEEP else monitor  # type: ignore[assignment]
 
-        w, h = (
-            self._current_size
-            or self._fixed_window_size
-            or (
-                self._buf.width,
-                self._buf.height,
-            )
+        w, h = self._current_size or self._fixed_window_size or (
+            self._buf.width,
+            self._buf.height,
         )
         self._position_requested = True
         self._requested_local_position = pos
         self._monitor_index = mon  # type: ignore[assignment]
         gx, gy = self._resolve_global_position(mon, pos)  # type: ignore[arg-type]
         self._placement.set_position(gx, gy, w, h)
-        # Re-arm a few retries: a position change requested well after
-        # startup is not racing the initial map, but it costs nothing to
-        # also cover a monitor hot-plug or compositor-side reset racing
-        # this particular call.
-        self._placement_retries_remaining = max(
-            self._placement_retries_remaining, _PLACEMENT_RETRY_FRAMES
-        )
+        # Re-arm the settle window: a position change requested well
+        # after startup is not racing the initial map, but it costs
+        # nothing to also cover a monitor hot-plug or compositor-side
+        # reset racing this particular call — and it means a late move
+        # gets the same requested-vs-actual report as the initial one.
+        self._arm_placement_settle()
 
     def get_position(self) -> WindowPosition:
         """Returns the last-requested position in whatever convention was
@@ -842,6 +1053,28 @@ class DisplayClient:
         manager refused a resize — they diverge silently otherwise.
         """
         return self._current_size
+
+    def placement_backend(self) -> str:
+        """Name of the placement backend that activated for this window.
+
+        One of "x11-ewmh", "kwin", "none" — or "" before `run_async()`
+        has created the window. Which one you get decides what is
+        actually available: only "x11-ewmh" can read the window's
+        geometry back (`actual_position()`) or do click-through, so this
+        is the first thing to check when either of those silently does
+        nothing. See placement/chain.py for how it is chosen and for the
+        WBB_PLACEMENT override.
+        """
+        return "" if self._placement is None else getattr(self._placement, "name", "?")
+
+    def position_method(self) -> str:
+        """Which positioning mechanism the backend is currently using.
+
+        The backend may have several and switches between them based on
+        whether the window actually moved (see chain.py and
+        placement/x11_ewmh.py). Cosmetic — for logs and diagnostics.
+        """
+        return self._position_method_name()
 
     def is_alpha_active(self) -> bool:
         """True if the window really has a per-pixel alpha visual.

@@ -133,6 +133,15 @@ class NoPlacement:
     def supports_position(self) -> bool:
         return False
 
+    def actual_position(self) -> "tuple[int, int] | None":
+        return None
+
+    def position_method(self) -> str:
+        return "none"
+
+    def next_position_method(self) -> bool:
+        return False
+
     def set_click_through(self, enabled: bool) -> bool:
         log.warning(
             "click_through requested but no placement backend is active "

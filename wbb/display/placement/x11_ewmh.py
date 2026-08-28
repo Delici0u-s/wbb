@@ -28,13 +28,37 @@ from ._base import NativeHandle
 log = logging.getLogger(__name__)
 
 
+def _u32(value: int) -> int:
+    """Two's-complement `value` into the unsigned slot python-xlib packs.
+
+    A format-32 ClientMessage payload is packed with `array('I', ...)`
+    (see `Xlib.protocol.rq.PropertyData.pack_value`), which raises
+    OverflowError on a negative number rather than reinterpreting it. So
+    a perfectly ordinary global coordinate — a monitor to the left of
+    the primary has a negative x, one mounted higher gives its neighbour
+    a negative y — used to take the whole render loop down with it.
+    Masking here produces the same 32 bits the X server reads back as a
+    signed INT32, which is what the protocol expects on the wire.
+    """
+    return int(value) & 0xFFFFFFFF
+
+
 class X11Placement:
     name = "x11-ewmh"
+
+    #: Positioning mechanisms, in the order they are tried. Ordered by
+    #: how well specified they are rather than by how likely they are to
+    #: work: the EWMH client message is the one window managers are
+    #: asked to honour exactly, the move-only ConfigureRequest is the
+    #: conservative fallback, and the full-geometry ConfigureRequest is
+    #: last because a WM enforcing SDL's size hints can reject it whole.
+    _METHODS = ("ewmh", "move", "configure")
 
     def __init__(self) -> None:
         self._disp = None
         self._window = None
         self._active = False
+        self._method_index = 0
 
     # ------------------------------------------------------------------
     def activate(self, handle: NativeHandle) -> bool:
@@ -81,34 +105,75 @@ class X11Placement:
         self._disp.flush()
 
     def set_position(self, x: int, y: int, width: int, height: int) -> None:
+        """Move the window using the currently selected mechanism.
+
+        There is no single mechanism every window manager honours, so
+        this owns several and the caller advances between them based on
+        a readback (see `next_position_method` and
+        DisplayClient._settle_placement). Trying them blindly in one
+        call is not an option: if two mechanisms are both honoured, the
+        second overwrites the first, and if one is reinterpreted by the
+        WM's placement policy it can undo a move that already worked.
+        One at a time, measured, is the only version that converges.
+        """
         if not self._active or self._window is None or self._disp is None:
             return
+        method = self._METHODS[self._method_index]
+        try:
+            if method == "ewmh":
+                self._send_moveresize(x, y, width, height)
+            elif method == "move":
+                self._send_configure(x, y, None, None)
+            else:
+                self._send_configure(x, y, width, height)
+        except Exception:
+            log.debug(
+                "x11-ewmh: position mechanism %r raised; it will be "
+                "advanced past on the next settle check",
+                method,
+                exc_info=True,
+            )
+
+    def position_method(self) -> str:
+        return self._METHODS[self._method_index]
+
+    def next_position_method(self) -> bool:
+        """Advance to the next mechanism, or False when exhausted.
+
+        Monotonic, so repeated calls terminate. Not reset by a later
+        move: once the readback has shown which mechanism this window
+        manager actually honours, every subsequent `set_position()`
+        uses it directly and pays nothing for the search.
+        """
+        if self._method_index + 1 >= len(self._METHODS):
+            return False
+        self._method_index += 1
+        log.info(
+            "x11-ewmh: switching position mechanism to %r",
+            self._METHODS[self._method_index],
+        )
+        return True
+
+    def _send_moveresize(self, x: int, y: int, width: int, height: int) -> None:
+        """EWMH `_NET_MOVERESIZE_WINDOW` client message to the root window.
+
+        The EWMH-blessed way for a client to position a window it owns
+        (freedesktop wm-spec, "Other Root Window Messages"). Window
+        managers treat it like a ConfigureRequest but are asked to
+        honour the exact geometry, and with StaticGravity the (x, y) is
+        the client window's top-left in root coordinates regardless of
+        decorations — the same reference `actual_position()` measures.
+        This mirrors `set_above()`, which is also an EWMH client
+        message rather than a direct property poke.
+
+        data.l[0] = gravity (low byte) + presence/source flags:
+          gravity          = StaticGravity (10)   -> bits 0..7
+          x,y,w,h present  = 0xF00                -> bits 8..11
+          source           = pager/taskbar (0b10) -> bits 12..15
+        """
         from Xlib import X  # noqa: PLC0415
         from Xlib.protocol import event as xevent  # noqa: PLC0415
 
-        # IMPORTANT: a raw XConfigureWindow / window.configure(x=, y=) on a
-        # window the WM *manages* is delivered to the compositor as an
-        # ordinary ConfigureRequest, which KWin is free to reinterpret or
-        # re-place (apply placement policy, snap to a work area, etc.). On
-        # KDE/X11 the net effect is that the position you ask for is
-        # silently overridden — the window won't move where requested even
-        # though the coordinates are valid. (This is why a manual
-        # alt+F3 → Move works but a scripted configure doesn't: different
-        # code path in the WM.)
-        #
-        # The EWMH-correct way to position a managed window from a client
-        # is the _NET_MOVERESIZE_WINDOW root-window client message
-        # (freedesktop wm-spec §"Other Root Window Messages"). Window
-        # Managers treat it like a ConfigureRequest but honor the exact
-        # geometry, and with StaticGravity the (x, y) is the frame's
-        # top-left in root coordinates regardless of decorations. This
-        # mirrors how set_above() already uses an EWMH client message
-        # rather than poking properties directly.
-        #
-        # data.l[0] = gravity (low byte) + presence/source flags:
-        #   gravity      = StaticGravity (10)  -> bits 0..7
-        #   x,y,w,h present = bits 8..11        -> 0xF00
-        #   source = pager/taskbar (0b10)       -> bits 12..15 -> 0x2000
         STATIC_GRAVITY = 10
         flags = STATIC_GRAVITY | (0x1 << 8) | (0x1 << 9) | (0x1 << 10) | (0x1 << 11)
         flags |= 0x2 << 12  # source indication: pager/taskbar
@@ -118,14 +183,82 @@ class X11Placement:
         ev = xevent.ClientMessage(
             window=self._window,
             client_type=atom,
-            data=(32, [flags, int(x), int(y), int(width), int(height)]),
+            data=(32, [flags, _u32(x), _u32(y), _u32(width), _u32(height)]),
         )
         mask = X.SubstructureNotifyMask | X.SubstructureRedirectMask
         root.send_event(ev, event_mask=mask)
         self._disp.flush()
 
+    def _send_configure(
+        self, x: int, y: int, width: "int | None", height: "int | None"
+    ) -> None:
+        """ConfigureRequest via `XConfigureWindow` on the client window.
+
+        The window manager selects SubstructureRedirect on the frame, so
+        this arrives as a ConfigureRequest it is free to reinterpret —
+        apply a placement policy, snap to a work area, or ignore it.
+        That is exactly why it is not the first mechanism tried. It is
+        here because some window managers act on this and not on the
+        client message above, and there is no way to know which from
+        inside the process without measuring.
+
+        `width`/`height` of None sends a move with no size change. SDL
+        pins PMinSize == PMaxSize on a non-resizable window, so a
+        ConfigureRequest carrying a size can be rejected outright by a
+        WM enforcing those hints, taking the position with it. The
+        move-only form avoids that, which is why it is ordered ahead of
+        the full geometry form.
+        """
+        attrs: dict[str, int] = {"x": int(x), "y": int(y)}
+        if width is not None and height is not None:
+            attrs["width"] = int(width)
+            attrs["height"] = int(height)
+        self._window.configure(**attrs)
+        self._disp.flush()
+
     def supports_position(self) -> bool:
         return self._active
+
+    def actual_position(self) -> Optional[tuple[int, int]]:
+        """The client window's top-left in root coordinates.
+
+        Walks the window up its parent chain summing each level's
+        `get_geometry()` x/y, which are relative to that level's parent.
+        Stopping at (and not including) the root yields root-relative
+        coordinates, correctly accounting for the reparenting the window
+        manager does when it wraps the window in a frame.
+
+        This is the *client* window's origin, not the frame's — which is
+        the same reference `set_position()` uses, since it sends
+        `_NET_MOVERESIZE_WINDOW` with StaticGravity (see there). So the
+        two numbers are comparable without a decoration correction, and
+        stay comparable if the window ever stops being borderless.
+
+        Cost: one `get_geometry` + one `query_tree` round-trip per level,
+        typically two levels under a reparenting WM. Off the hot path —
+        DisplayClient only calls this during the placement-settle window
+        and on demand.
+        """
+        if not self._active or self._window is None or self._disp is None:
+            return None
+        try:
+            root_id = self._disp.screen().root.id
+            win = self._window
+            x = y = 0
+            # Bounded so a cycle or an unexpectedly deep tree cannot
+            # spin here; real chains are 1-3 levels.
+            for _ in range(32):
+                geom = win.get_geometry()
+                x += int(geom.x)
+                y += int(geom.y)
+                parent = win.query_tree().parent
+                if parent is None or int(parent.id) == int(root_id):
+                    return (x, y)
+                win = parent
+            return None
+        except Exception:
+            log.debug("x11-ewmh: could not read the window geometry back", exc_info=True)
+            return None
 
     def set_click_through(self, enabled: bool) -> bool:
         """

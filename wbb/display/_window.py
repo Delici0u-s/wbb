@@ -173,6 +173,24 @@ def centered_position(
     return (max(0, (d.width - width) // 2), max(0, (d.height - height) // 2))
 
 
+def video_driver() -> str:
+    """Which video driver SDL2 selected — "x11", "wayland", "windows"...
+
+    Worth checking before debugging anything placement-related: on a
+    Plasma Wayland session SDL2 may pick either `x11` (an XWayland
+    window, where EWMH and the SHAPE extension are available) or
+    `wayland` (a native surface, where neither is and the compositor
+    owns positioning entirely). The two behave nothing alike and there
+    is no way to tell them apart from the session type alone.
+
+    Initialises SDL video if it is not up yet. Returns "" if SDL cannot
+    report one.
+    """
+    _ensure_sdl_init()
+    name = sdl2.SDL_GetCurrentVideoDriver()
+    return name.decode(errors="replace") if name else ""
+
+
 def list_displays() -> list[DisplayBounds]:
     """
     Enumerate every monitor's global bounding rectangle via
@@ -232,6 +250,7 @@ class SDLWindow:
         alpha: bool = False,
         gamescope_overlay: bool = False,
         x11_display_name: Optional[str] = None,
+        position: Optional[tuple[int, int]] = None,
     ) -> None:
         # MUST run before _ensure_sdl_init(). SDL2's X11 backend resolves
         # the screen's visual once, in X11_VideoInit — i.e. inside
@@ -279,6 +298,10 @@ class SDLWindow:
         self._wm_class = wm_class
         self._window_type = window_type
         self._x11_display_name = x11_display_name
+        # Stored, not passed through, because _create_window_and_renderer
+        # runs a second time on the alpha software-renderer retry below
+        # and must recreate the window at the same place.
+        self._position = position
         self._create_window_and_renderer(title, width, height, flags, alpha)
 
         handle = self.native_handle()
@@ -395,10 +418,30 @@ class SDLWindow:
         if force_software:
             sdl2.SDL_SetHint(b"SDL_RENDER_DRIVER", b"software")
 
+        # A real position here, rather than SDL_WINDOWPOS_UNDEFINED, is
+        # what stops the window manager applying its own placement
+        # policy at map time. SDL2's X11 backend turns a concrete x/y
+        # into a USPosition entry in WM_NORMAL_HINTS, the standard "the
+        # user asked for exactly this spot" signal, and WMs skip
+        # placement for windows carrying it. Without this the window is
+        # born wherever the WM decides (KWin's placement policy is
+        # configurable and "Centered" is one of the choices) and the
+        # requested position only ever arrives afterwards, as a move
+        # the WM is free to refuse.
+        #
+        # NOT independently verified that KWin honours USPosition for
+        # every window type — notably notification/OSD types, which KWin
+        # groups as "special windows". DisplayClient's placement-settle
+        # readback reports what actually happened; see
+        # client.py's _settle_placement().
+        pos_x, pos_y = (
+            self._position if self._position is not None
+            else (sdl2.SDL_WINDOWPOS_UNDEFINED, sdl2.SDL_WINDOWPOS_UNDEFINED)
+        )
         self.window = sdl2.SDL_CreateWindow(
             title.encode(),
-            sdl2.SDL_WINDOWPOS_UNDEFINED,
-            sdl2.SDL_WINDOWPOS_UNDEFINED,
+            pos_x,
+            pos_y,
             width,
             height,
             flags,

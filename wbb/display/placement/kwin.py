@@ -207,7 +207,14 @@ class KWinPlacement:
             return False
 
         self._active = True
-        log.info("Placement: using KWin D-Bus scripting (wm_class=%r)", self._wm_class)
+        log.info(
+            "Placement: using KWin D-Bus scripting (wm_class=%r, subsystem=%r). "
+            "No geometry readback and no click-through are available through "
+            "this backend; on an x11 window the EWMH backend provides both and "
+            "is tried first (see chain.py).",
+            self._wm_class,
+            getattr(handle, "subsystem", "?"),
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -223,6 +230,33 @@ class KWinPlacement:
 
     def supports_position(self) -> bool:
         return self._active
+
+    def actual_position(self) -> Optional[tuple[int, int]]:
+        """Not available: always None ("unknown"), never a wrong number.
+
+        The geometry is readable inside a KWin script — the geometry
+        body already prints it (see `_SET_GEOMETRY_BODY`) — but a
+        script's output goes to KWin's journal, not back over D-Bus to
+        `run()`'s caller. Returning it would need a second channel (a
+        temp file the script writes, or a D-Bus signal), which is a
+        larger change than the reporting it would feed. `journalctl
+        --user -u plasma-kwin_wayland -f | grep wbb` shows the same
+        numbers today.
+        """
+        return None
+
+    def position_method(self) -> str:
+        return "kwin-script"
+
+    def next_position_method(self) -> bool:
+        """Single mechanism: the geometry script. Nothing to fall back to.
+
+        The script already tries four geometry-setting forms internally
+        (see `_SET_GEOMETRY_BODY`) because KWin versions differ in which
+        one takes, so the alternatives that exist here are exhausted
+        within one call rather than across calls.
+        """
+        return False
 
     def set_click_through(self, enabled: bool) -> bool:
         """

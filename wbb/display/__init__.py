@@ -26,6 +26,7 @@ if TYPE_CHECKING:
         centered_position,
         list_displays,
         preinit_alpha,
+        video_driver,
     )
     from .client import DisplayClient, WindowPosition
 
@@ -36,6 +37,7 @@ _LAZY = {
     "list_displays": "._window",
     "centered_position": "._window",
     "preinit_alpha": "._window",
+    "video_driver": "._window",
 }
 
 
@@ -66,6 +68,7 @@ __all__ = [
     "list_displays",
     "centered_position",
     "preinit_alpha",
+    "video_driver",
     "Anchor",
     "anchored_origin",
     "WindowType",

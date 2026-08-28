@@ -98,6 +98,49 @@ class PlacementBackend(Protocol):
         """True if set_position() will have a real effect right now."""
         ...
 
+    def actual_position(self) -> Optional[tuple[int, int]]:
+        """Where the window really is, in global desktop coordinates.
+
+        Same coordinate space `set_position()` takes, so the two are
+        directly comparable — that comparison is the only way to tell
+        "the window manager honoured the move" from "the window manager
+        silently dropped it", which every mechanism here fails at
+        silently by design (an EWMH client message has no reply, and a
+        KWin script's return value is not plumbed back).
+
+        Returns None when this backend cannot read the geometry back.
+        None means "unknown", never "wrong" — callers must not treat it
+        as a failed move.
+        """
+        return None
+
+    def position_method(self) -> str:
+        """Name of the mechanism `set_position()` is currently using.
+
+        For logging only. A backend with a single mechanism returns a
+        constant.
+        """
+        return "default"
+
+    def next_position_method(self) -> bool:
+        """Switch to an untried positioning mechanism. True if switched.
+
+        There is no portable answer to "how do you move a window": a
+        window manager may honour an EWMH client message, or only a
+        ConfigureRequest, or neither once the window is mapped, and
+        which of those holds depends on the WM, its configuration, the
+        window's type, and any matching window rules. Rather than
+        picking one and hoping, a backend advertises the mechanisms it
+        has and the caller advances through them, keeping whichever one
+        the readback shows actually moved the window (see
+        DisplayClient._settle_placement).
+
+        Returns False when the backend has no alternative left, which
+        ends the search. Backends must advance monotonically so that
+        repeated calls terminate.
+        """
+        return False
+
     def set_click_through(self, enabled: bool) -> bool:
         """
         Attempt to make the window pass all mouse/touch input through
