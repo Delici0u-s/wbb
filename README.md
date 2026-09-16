@@ -8,6 +8,8 @@ Render a live website into an off-screen pixel buffer and expose it as a program
 
 ```bash
 pip install wbb
+# or even better
+pip install 'wbb[all]'        # display + both placement backends + fast-jpeg
 ```
 
 System requirements:
