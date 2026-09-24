@@ -71,6 +71,15 @@ class NoPlacement:
         have_xlib = _module_available("Xlib")  # python-xlib imports as `Xlib`
         kde = _is_kde()
 
+        # Windows -> win32 backend, which needs nothing beyond user32.
+        if handle.subsystem == "windows":
+            return (
+                "This is a Windows window, but the win32 backend did not "
+                "activate — user32 could not be bound or the window handle "
+                "was not live. Run with WBB_PLACEMENT=win32 and debug "
+                "logging for details."
+            )
+
         # KDE (either session type) -> KWin backend, needs pydbus + PyGObject.
         if kde or handle.subsystem == "wayland":
             # On Wayland, KWin is the ONLY option regardless of desktop string.

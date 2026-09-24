@@ -15,6 +15,8 @@ available and they are not equivalent:
   of that.
 * A **native Wayland surface** has no X11 window to act on, so KWin's
   D-Bus scripting is the only lever that exists and goes first.
+* A **Windows window** gets the win32 backend only; neither X11 nor
+  KWin can apply there, so probing them is skipped.
 
 The previous order put KWin first unconditionally. On KDE that meant an
 XWayland window — the common case on a Plasma Wayland session — never
@@ -24,7 +26,7 @@ as the fallback for an X11 window whose X11 backend declined (no
 python-xlib installed, no reachable display), which is the case that
 ordering was presumably meant to serve.
 
-`WBB_PLACEMENT=x11|kwin|none` forces one backend and skips the rest.
+`WBB_PLACEMENT=x11|kwin|win32|none` forces one backend and skips the rest.
 For reproducing a report from a machine you do not have, and for
 checking whether a placement problem is the backend's fault or the
 window's; not a supported configuration surface.
@@ -44,6 +46,7 @@ import os
 from ._base import NativeHandle, PlacementBackend
 from .kwin import KWinPlacement
 from .none import NoPlacement
+from .win32 import Win32Placement
 from .x11_ewmh import X11Placement
 
 log = logging.getLogger(__name__)
@@ -56,13 +59,14 @@ def _forced() -> str:
 def select_backend(handle: NativeHandle, *, wm_class: str) -> PlacementBackend:
     x11 = X11Placement()
     kwin = KWinPlacement(wm_class)
+    win32 = Win32Placement()
 
     forced = _forced()
     if forced:
-        chosen = {"x11": [x11], "kwin": [kwin], "none": []}.get(forced)
+        chosen = {"x11": [x11], "kwin": [kwin], "win32": [win32], "none": []}.get(forced)
         if chosen is None:
             log.warning(
-                "WBB_PLACEMENT=%r is not one of x11/kwin/none; ignoring it.", forced
+                "WBB_PLACEMENT=%r is not one of x11/kwin/win32/none; ignoring it.", forced
             )
         else:
             log.info("Placement: WBB_PLACEMENT=%r forces the backend choice", forced)
@@ -70,7 +74,12 @@ def select_backend(handle: NativeHandle, *, wm_class: str) -> PlacementBackend:
             return _first_activating(chain, handle)
 
     # Subsystem decides the order; see the module docstring.
-    chain = [x11, kwin] if handle.subsystem == "x11" else [kwin, x11]
+    if handle.subsystem == "windows":
+        chain = [win32]
+    elif handle.subsystem == "x11":
+        chain = [x11, kwin]
+    else:
+        chain = [kwin, x11]
     chain.append(NoPlacement())
     return _first_activating(chain, handle)
 

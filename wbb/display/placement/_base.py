@@ -32,7 +32,7 @@ class NativeHandle:
     Whatever SDL2 reports about the real window via
     ``SDL_GetWindowWMInfo`` — see ``_window.py``'s ``native_handle()``.
 
-    Exactly one of the wayland/x11 fields is populated, matching
+    Exactly one of the wayland/x11/win32 fields is populated, matching
     ``subsystem``. ``window_title``/``wm_class`` are passed through
     separately because the KWin backend matches by those, not by a
     raw surface pointer (see ``placement/kwin.py`` for why — KWin's
@@ -41,13 +41,14 @@ class NativeHandle:
     X", the same names ``Window Rules`` in System Settings use).
     """
 
-    subsystem: str  # "wayland" | "x11" | "unknown"
+    subsystem: str  # "wayland" | "x11" | "windows" | "unknown"
     window_title: str
     wm_class: str
     wayland_display: Optional[int] = None
     wayland_surface: Optional[int] = None
     x11_display: Optional[int] = None
     x11_window: Optional[int] = None
+    win32_hwnd: Optional[int] = None
 
 
 class PlacementBackend(Protocol):

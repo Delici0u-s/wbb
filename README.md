@@ -14,7 +14,7 @@ pip install 'wbb[all]'        # display + both placement backends + fast-jpeg
 
 System requirements:
 
-- **Chrome or Chromium** on `PATH` (checked names: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`; common macOS/Windows install paths are also checked). Override with the `CHROME_PATH` environment variable.
+- **Chrome or Chromium** on `PATH` (checked names: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `chrome`; common macOS/Windows install paths, per-user Windows installs and the Windows registry are also checked). On Windows, **Microsoft Edge** (Chromium-based, preinstalled) is used as a last resort if no Chrome/Chromium is found. Override with the `CHROME_PATH` environment variable.
 - **ffmpeg**, only if you pipe frames to it yourself (see `examples/05_record_to_ffmpeg.py`). Not a library dependency.
 
 ### Optional extras
@@ -40,9 +40,12 @@ Quote the brackets (`'wbb[kde]'`) — some shells (zsh) treat them as globs othe
 | KDE Plasma (X11 or Wayland) | `wbb[kde]` | KWin D-Bus scripting |
 | GNOME/X11, XFCE, i3, other X11 | `wbb[x11]` | X11 / EWMH |
 | GNOME Wayland, other non-KDE Wayland | *(none available)* | no-op — see below |
+| Windows 10/11 | `wbb[display]` (nothing extra) | Win32 (`SetWindowPos`, built in via ctypes) |
 | Not sure | `wbb[all]` | best available |
 
 If no matching backend is installed (or available), `DisplayClient` still runs — it just falls back to a plain, compositor-placed window and logs **one** warning at startup telling you exactly which package to install, with a copy-pasteable command targeting your current interpreter (so it works inside a venv).
+
+> **Windows notes.** Placement, always-on-top, position readback and `click_through` use plain Win32 calls, no extra packages. `alpha=True` renders through `UpdateLayeredWindow` instead of the SDL renderer (DWM composites normal windows opaque, and SDL2 has no transparent-window flag). Three differences from Linux follow from that: alpha windows are always borderless; fully transparent pixels (alpha 0) do not receive mouse input — clicks pass through them; and each frame costs one extra CPU-side RGBA→BGRA copy (~3 ms at 1080p). wbb makes the process per-monitor DPI aware before SDL starts so positions are physical pixels on scaled monitors; override with the `SDL_WINDOWS_DPI_AWARENESS` environment variable if your application needs something else. `window_type` has no effect on Windows.
 
 > **Wayland reality check.** Wayland has no protocol for a client to set its own absolute position or stay-on-top. On KDE Wayland the *only* mechanism is the KWin scripting backend (`wbb[kde]`). On non-KDE Wayland (e.g. GNOME) there is currently no positioning backend at all — run under an X11/XWayland session if you need precise placement there.
 
@@ -462,7 +465,7 @@ Issues and pull requests welcome. For non-trivial changes, open an issue first t
 ## Maintainer notes (publishing)
 
 ```bash
-pip install "setuptools>=68" wheel "numpy>=1.24" "websockets>=12.0" "Pillow>=10.0" "aiohttp>=3.9" "PyGObject>=3.50" "PyTurboJPEG>=1.7"
+pip install build twine
 rm -rf dist/ build/ *.egg-info
 # bump version in pyproject.toml and wbb/__init__
 python -m build
@@ -470,6 +473,6 @@ twine check --repository testpypi dist/*
 twine upload --repository testpypi dist/*
 twine check dist/*
 twine upload dist/*
-git tag v0.1.4.2
-git push origin v0.1.4.2
+git tag v0.1.6
+git push origin v0.1.6
 ```

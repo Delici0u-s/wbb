@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,6 +68,7 @@ import sdl2
 import sdl2.syswm as syswm
 
 from .. import _compat
+from . import _win32
 from . import alpha as _alpha
 from .placement import NativeHandle
 from .window_type import WindowType, apply_gamescope_overlay, apply_window_type, needs_pre_map
@@ -80,6 +82,17 @@ def _ensure_sdl_init() -> None:
     global _SDL_INITIALIZED
     if _SDL_INITIALIZED:
         return
+    if sys.platform == "win32":
+        # Must precede SDL_Init: DPI awareness is process-wide and can
+        # only be set once, before the first window. Without it Windows
+        # virtualises coordinates on scaled monitors (125 %, 150 % ...),
+        # so positions, display bounds and window sizes all come out in
+        # scaled units, placement lands off by the scale factor, and a
+        # layered alpha window gets bitmap-stretched (blurry). Set at
+        # normal priority, so an SDL_WINDOWS_DPI_AWARENESS environment
+        # variable still overrides it. Needs SDL >= 2.24; older builds
+        # ignore the unknown hint.
+        sdl2.SDL_SetHint(b"SDL_WINDOWS_DPI_AWARENESS", b"permonitorv2")
     if sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO) != 0:
         raise RuntimeError(f"SDL_Init failed: {sdl2.SDL_GetError().decode(errors='replace')}")
     _SDL_INITIALIZED = True
@@ -290,6 +303,18 @@ class SDLWindow:
         # already in place. See window_type.py.
         self._pre_map = needs_pre_map(window_type) or gamescope_overlay
         flags = sdl2.SDL_WINDOW_HIDDEN if self._pre_map else sdl2.SDL_WINDOW_SHOWN
+
+        # Windows per-pixel alpha goes through UpdateLayeredWindow, not
+        # the SDL renderer; see _win32.py. The layered bitmap covers the
+        # whole window rect, frame included, so a framed window would
+        # lose its decorations and get mouse coordinates offset by the
+        # frame. Force borderless rather than ship that.
+        self._layered: Optional[_win32.LayeredPresenter] = None
+        use_layered = alpha and sys.platform == "win32" and _win32.available()
+        if use_layered and not borderless:
+            log.info("alpha: forcing borderless on Windows (layered windows have no frame)")
+            borderless = True
+
         if borderless:
             flags |= sdl2.SDL_WINDOW_BORDERLESS
         if resizable:
@@ -302,11 +327,17 @@ class SDLWindow:
         # runs a second time on the alpha software-renderer retry below
         # and must recreate the window at the same place.
         self._position = position
-        self._create_window_and_renderer(title, width, height, flags, alpha)
+        self._create_window_and_renderer(
+            title, width, height, flags, alpha, with_renderer=not use_layered
+        )
 
         handle = self.native_handle()
         self.alpha_active: bool = False
-        if alpha:
+        if use_layered:
+            self.alpha_active = self._init_layered(handle, alpha)
+            if not self.alpha_active:
+                handle = self.native_handle()
+        elif alpha:
             verified = _alpha.verify(handle, display_name=x11_display_name)
             # None => not determinable (native Wayland, or no python-xlib).
             # On Wayland the surface is ARGB anyway, so None is optimistic
@@ -363,6 +394,31 @@ class SDLWindow:
         self._mouse = MouseState()
         _LIVE_WINDOWS.add(id(self))
 
+    def _init_layered(self, handle: NativeHandle, alpha: bool) -> bool:
+        """Attach a LayeredPresenter; on failure, fall back to an opaque
+        window with the normal SDL renderer. Returns alpha_active."""
+        hwnd = handle.win32_hwnd
+        if hwnd:
+            try:
+                self._layered = _win32.LayeredPresenter(hwnd)
+                log.info("alpha: active (win32 UpdateLayeredWindow)")
+                return True
+            except Exception:
+                log.exception("alpha: could not set up the layered window")
+        else:
+            log.warning("alpha: SDL did not report a Win32 window handle")
+
+        log.warning("alpha=True requested but unavailable; frames will render opaque.")
+        self.renderer = sdl2.SDL_CreateRenderer(
+            self.window, -1, sdl2.SDL_RENDERER_ACCELERATED | sdl2.SDL_RENDERER_PRESENTVSYNC
+        ) or sdl2.SDL_CreateRenderer(self.window, -1, 0)
+        if not self.renderer:
+            raise RuntimeError(
+                f"SDL_CreateRenderer failed: {sdl2.SDL_GetError().decode(errors='replace')}"
+            )
+        _alpha.configure_renderer(self.renderer, False)
+        return False
+
     # ------------------------------------------------------------------
     # Native handle (for placement backends)
     # ------------------------------------------------------------------
@@ -390,6 +446,13 @@ class SDLWindow:
                 x11_display=int(info.info.x11.display or 0) or None,
                 x11_window=int(info.info.x11.window or 0) or None,
             )
+        elif info.subsystem == sdl2.SDL_SYSWM_WINDOWS:
+            return NativeHandle(
+                subsystem="windows",
+                window_title=title,
+                wm_class=self._wm_class,
+                win32_hwnd=int(info.info.win.window or 0) or None,
+            )
         return NativeHandle(subsystem="unknown", window_title=title, wm_class=self._wm_class)
 
     def current_display_index(self) -> int:
@@ -412,8 +475,14 @@ class SDLWindow:
         alpha: bool,
         *,
         force_software: bool = False,
+        with_renderer: bool = True,
     ) -> None:
-        """Create the SDL window and its renderer. Idempotent per call."""
+        """Create the SDL window and its renderer. Idempotent per call.
+
+        with_renderer=False creates the window only; used for the Win32
+        layered alpha path, where a Direct3D swap chain on the same
+        window would fight UpdateLayeredWindow.
+        """
         self._software_renderer = force_software
         if force_software:
             sdl2.SDL_SetHint(b"SDL_RENDER_DRIVER", b"software")
@@ -450,6 +519,10 @@ class SDLWindow:
             raise RuntimeError(
                 f"SDL_CreateWindow failed: {sdl2.SDL_GetError().decode(errors='replace')}"
             )
+
+        if not with_renderer:
+            self.renderer = None  # type: ignore[assignment]
+            return
 
         renderer_flags = (
             sdl2.SDL_RENDERER_SOFTWARE
@@ -504,6 +577,14 @@ class SDLWindow:
         filters that return a non-contiguous view (``crop``/``flip``)
         still get the one copy they genuinely need.
         """
+        if self._layered is not None:
+            # The swizzle into the DIB reads strided views, so no
+            # contiguity copy is needed on this path.
+            resized = self._layered.present(arr)
+            if resized:
+                self._tex_size = self._layered.size
+            return resized
+
         if arr.dtype != np.uint8 or not arr.flags["C_CONTIGUOUS"]:
             arr = np.ascontiguousarray(arr, dtype=np.uint8)
         h, w = arr.shape[0], arr.shape[1]
@@ -600,6 +681,9 @@ class SDLWindow:
         changed, only the window's idea of what is on screen has.
         No-op before the first push_frame().
         """
+        if self._layered is not None:
+            self._layered.present_again()
+            return
         if not self._texture:
             return
         sdl2.SDL_RenderClear(self.renderer)
@@ -723,6 +807,9 @@ class SDLWindow:
     # Lifecycle
     # ------------------------------------------------------------------
     def close(self) -> None:
+        if self._layered is not None:
+            self._layered.close()
+            self._layered = None
         if self._texture:
             sdl2.SDL_DestroyTexture(self._texture)
             self._texture = None

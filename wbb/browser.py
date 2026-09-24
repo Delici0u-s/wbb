@@ -64,25 +64,101 @@ _PLATFORM_PATHS: dict[str, list[str]] = {
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
     ],
-    "win32": [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Chromium\Application\chrome.exe",
-    ],
 }
 
 
+def _windows_paths() -> tuple[list[Path], list[Path]]:
+    """(chrome_like, edge) install locations on Windows.
+
+    Built from the environment rather than hard-coded drive letters:
+    Chrome's default *per-user* install (no admin rights) lives under
+    %LOCALAPPDATA%, which a fixed Program Files list never finds,
+    and Program Files is not always on C:.
+    """
+    roots = [
+        os.environ.get(var)
+        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
+    ]
+    bases = [Path(r) for r in roots if r]
+    chrome = [
+        b / sub / "Application" / "chrome.exe"
+        for b in bases
+        for sub in (Path("Google/Chrome"), Path("Chromium"))
+    ]
+    edge = [b / "Microsoft/Edge/Application/msedge.exe" for b in bases]
+    return chrome, edge
+
+
+def _windows_app_path(exe: str) -> Optional[str]:
+    """Look `exe` up in the registry's App Paths, where installers register it.
+
+    Catches installs in non-default locations that neither PATH nor the
+    fixed directories cover.
+    """
+    try:
+        import winreg  # noqa: PLC0415 — Windows-only stdlib module
+    except ImportError:
+        return None
+    key = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                value, _ = winreg.QueryValueEx(k, None)
+        except OSError:
+            continue
+        if value and Path(value).exists():
+            return str(value)
+    return None
+
+
 def _find_chrome() -> str:
+    """Locate a Chromium-based browser that speaks CDP.
+
+    Order: CHROME_PATH, then Chrome/Chromium (PATH, platform install
+    dirs, Windows registry), and on Windows Microsoft Edge last. Edge is
+    Chromium-based and ships with every Windows 10/11 install, so it is
+    what makes wbb work out of the box there; it is only picked when no
+    Chrome/Chromium exists, and it is logged so the choice is visible.
+    Set CHROME_PATH to force a specific browser.
+    """
     if env := os.environ.get("CHROME_PATH"):
         return env
+    checked: list[str] = []
     for name in _CANDIDATES:
         if found := shutil.which(name):
             return found
+    checked.append(f"PATH names {_CANDIDATES}")
+
     for path in _PLATFORM_PATHS.get(sys.platform, []):
         if Path(path).exists():
             return path
+        checked.append(path)
+
+    if sys.platform == "win32":
+        chrome_paths, edge_paths = _windows_paths()
+        for p in chrome_paths:
+            if p.exists():
+                return str(p)
+            checked.append(str(p))
+        if found := _windows_app_path("chrome.exe"):
+            return found
+        checked.append(r"registry App Paths\chrome.exe")
+
+        edge = shutil.which("msedge") or _windows_app_path("msedge.exe")
+        if edge is None:
+            edge = next((str(p) for p in edge_paths if p.exists()), None)
+        if edge is not None:
+            log.info(
+                "Chrome/Chromium not found; using Microsoft Edge (%s). Set "
+                "CHROME_PATH to use a different browser.",
+                edge,
+            )
+            return edge
+        checked.append("Microsoft Edge (PATH, registry, install dirs)")
+
     raise FileNotFoundError(
-        "Chrome/Chromium not found. Install it or set the CHROME_PATH environment variable."
+        "Chrome/Chromium not found. Install it or set the CHROME_PATH "
+        "environment variable. Checked:\n  " + "\n  ".join(checked)
     )
 
 
