@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wbb"
-version = "0.1.5.2"
+version = "0.1.5.3"
 description = "Render a live website into an off-screen pixel buffer and expose it as a programmable primitive"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,9 +35,9 @@ display = ["PySDL2>=0.9.16", "pysdl2-dll>=2.28"]
 #   KDE Plasma (X11 OR Wayland): KWin D-Bus scripting backend.
 #     Needs pydbus + PyGObject. This is the ONLY option on a Wayland
 #     session — Wayland has no client-side window positioning protocol.
-kde = ["pydbus>=0.6", "PyGObject>=3.50"]
+kde = ["pydbus>=0.6; sys_platform != 'win32' and sys_platform != 'darwin'", "PyGObject>=3.50; sys_platform != 'win32' and sys_platform != 'darwin'"]
 #   Non-KDE X11 desktops (GNOME/X11, XFCE, i3, ...): EWMH backend.
-x11 = ["python-xlib>=0.33"]
+x11 = ["python-xlib>=0.33; sys_platform != 'win32' and sys_platform != 'darwin'"]
 
 # --- Convenience umbrellas ----------------------------------------------
 # Everything needed to run the SDL display with placement working on the
@@ -46,9 +46,9 @@ x11 = ["python-xlib>=0.33"]
 all = [
     "PySDL2>=0.9.16",
     "pysdl2-dll>=2.28",
-    "pydbus>=0.6",
-    "PyGObject>=3.50",
-    "python-xlib>=0.33",
+    "pydbus>=0.6; sys_platform != 'win32' and sys_platform != 'darwin'",
+    "PyGObject>=3.50; sys_platform != 'win32' and sys_platform != 'darwin'",
+    "python-xlib>=0.33; sys_platform != 'win32' and sys_platform != 'darwin'",
     "PyTurboJPEG>=1.7",
 ]
 
